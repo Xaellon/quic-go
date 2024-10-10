@@ -108,3 +108,19 @@ func (r *RTTStats) SetInitialRTT(t time.Duration) {
 	r.smoothedRTT = t
 	r.latestRTT = t
 }
+
+// OnConnectionMigration is called when connection migrates and rtt measurement needs to be reset.
+func (r *RTTStats) OnConnectionMigration() {
+	r.latestRTT = 0
+	r.minRTT = 0
+	r.smoothedRTT = 0
+	r.meanDeviation = 0
+}
+
+// ExpireSmoothedMetrics causes the smoothed_rtt to be increased to the latest_rtt if the latest_rtt
+// is larger. The mean deviation is increased to the most recent deviation if
+// it's larger.
+func (r *RTTStats) ExpireSmoothedMetrics() {
+	r.meanDeviation = max(r.meanDeviation, (r.smoothedRTT - r.latestRTT).Abs())
+	r.smoothedRTT = max(r.smoothedRTT, r.latestRTT)
+}

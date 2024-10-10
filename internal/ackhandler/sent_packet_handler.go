@@ -3,8 +3,10 @@ package ackhandler
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
+	ext "github.com/quic-go/quic-go/congestion"
 	"github.com/quic-go/quic-go/internal/congestion"
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/qerr"
@@ -79,8 +81,9 @@ type sentPacketHandler struct {
 
 	bytesInFlight protocol.ByteCount
 
-	congestion congestion.SendAlgorithmWithDebugInfos
-	rttStats   *utils.RTTStats
+	congestion      congestion.SendAlgorithmWithDebugInfos
+	congestionMutex sync.RWMutex
+	rttStats        *utils.RTTStats
 
 	// The number of times a PTO has been sent without receiving an ack.
 	ptoCount uint32
@@ -925,4 +928,11 @@ func (h *sentPacketHandler) SetHandshakeConfirmed() {
 	// We don't send PTOs for application data packets before the handshake completes.
 	// Make sure the timer is armed now, if necessary.
 	h.setLossDetectionTimer()
+}
+
+func (h *sentPacketHandler) SetCongestionControl(cc ext.CongestionControl) {
+	h.congestionMutex.Lock()
+	cc.SetRTTStatsProvider(h.rttStats)
+	h.congestion = &ccAdapter{cc}
+	h.congestionMutex.Unlock()
 }
