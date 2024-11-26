@@ -26,7 +26,7 @@ func newPacer(getBandwidth func() Bandwidth) *pacer {
 			// RTT variations then won't result in under-utilization of the congestion window.
 			// Ultimately, this will result in sending packets as acknowledgments are received rather than when timers fire,
 			// provided the congestion window is fully utilized and acknowledgments arrive at regular intervals.
-			return bw * 5 / 4
+			return bw
 		},
 	}
 	p.budgetAtLastSent = p.maxBurstSize()

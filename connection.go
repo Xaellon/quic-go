@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go/internal/ackhandler"
+	"github.com/quic-go/quic-go/internal/congestion"
 	"github.com/quic-go/quic-go/internal/flowcontrol"
 	"github.com/quic-go/quic-go/internal/handshake"
 	"github.com/quic-go/quic-go/internal/protocol"
@@ -278,6 +279,7 @@ var newConnection = func(
 		clientAddressValidated,
 		s.conn.capabilities().ECN,
 		s.perspective,
+		congestion.Bandwidth(s.config.MaxPacingRate),
 		s.tracer,
 		s.logger,
 	)
@@ -388,6 +390,7 @@ var newClientConnection = func(
 		false, // has no effect
 		s.conn.capabilities().ECN,
 		s.perspective,
+		congestion.Bandwidth(s.config.MaxPacingRate),
 		s.tracer,
 		s.logger,
 	)

@@ -339,7 +339,13 @@ type Config struct {
 	Allow0RTT bool
 	// Enable QUIC datagram support (RFC 9221).
 	EnableDatagrams bool
-	Tracer          func(context.Context, logging.Perspective, ConnectionID) *logging.ConnectionTracer
+	// MaxPacingRate is the maximum rate at which packets are sent, in bits per second (bps).
+	// It is used to limit the bandwidth used by a connection.
+	// This value must be set and cannot be zero.
+	// Values higher than the available network bandwidth may lead to unexpected results.
+	MaxPacingRate uint64
+
+	Tracer func(context.Context, logging.Perspective, ConnectionID) *logging.ConnectionTracer
 }
 
 // ClientHelloInfo contains information about an incoming connection attempt.

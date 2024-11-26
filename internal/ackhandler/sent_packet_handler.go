@@ -115,17 +115,10 @@ func newSentPacketHandler(
 	clientAddressValidated bool,
 	enableECN bool,
 	pers protocol.Perspective,
+	maxPacingRate congestion.Bandwidth,
 	tracer *logging.ConnectionTracer,
 	logger utils.Logger,
 ) *sentPacketHandler {
-	congestion := congestion.NewCubicSender(
-		congestion.DefaultClock{},
-		rttStats,
-		initialMaxDatagramSize,
-		true, // use Reno
-		tracer,
-	)
-
 	h := &sentPacketHandler{
 		peerCompletedAddressValidation: pers == protocol.PerspectiveServer,
 		peerAddressValidated:           pers == protocol.PerspectiveClient || clientAddressValidated,
@@ -133,11 +126,19 @@ func newSentPacketHandler(
 		handshakePackets:               newPacketNumberSpace(0, false),
 		appDataPackets:                 newPacketNumberSpace(0, true),
 		rttStats:                       rttStats,
-		congestion:                     congestion,
 		perspective:                    pers,
 		tracer:                         tracer,
 		logger:                         logger,
 	}
+	congestion := congestion.NewBbrSender(
+		rttStats,
+		initialMaxDatagramSize,
+		maxPacingRate,
+		func() protocol.ByteCount {
+			return h.bytesInFlight
+		},
+	)
+	h.congestion = congestion
 	if enableECN {
 		h.enableECN = true
 		h.ecnTracker = newECNTracker(logger, tracer)
@@ -369,6 +370,9 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		}
 		h.removeFromBytesInFlight(p)
 		putPacket(p)
+	}
+	if intf, ok := h.congestion.(congestion.HandleAggregatedAcks); ok {
+		intf.OnAcksEnd(priorInFlight, rcvTime)
 	}
 	// After this point, we must not use ackedPackets any longer!
 	// We've already returned the buffers.
