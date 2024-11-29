@@ -1213,7 +1213,7 @@ func (s *connection) handleUnpackedLongHeaderPacket(
 			s.tracer.ReceivedLongHeaderPacket(packet.hdr, packetSize, ecn, frames)
 		}
 	}
-	isAckEliciting, err := s.handleFrames(packet.data, packet.hdr.DestConnectionID, packet.encryptionLevel, log)
+	isAckEliciting, err := s.handleFrames(packet.data, packet.hdr.DestConnectionID, packet.encryptionLevel, log, rcvTime)
 	if err != nil {
 		return err
 	}
@@ -1232,7 +1232,7 @@ func (s *connection) handleUnpackedShortHeaderPacket(
 	s.firstAckElicitingPacketAfterIdleSentTime = time.Time{}
 	s.keepAlivePingSent = false
 
-	isAckEliciting, err := s.handleFrames(data, destConnID, protocol.Encryption1RTT, log)
+	isAckEliciting, err := s.handleFrames(data, destConnID, protocol.Encryption1RTT, log, rcvTime)
 	if err != nil {
 		return err
 	}
@@ -1244,6 +1244,7 @@ func (s *connection) handleFrames(
 	destConnID protocol.ConnectionID,
 	encLevel protocol.EncryptionLevel,
 	log func([]logging.Frame),
+	rcvTime time.Time,
 ) (isAckEliciting bool, _ error) {
 	// Only used for tracing.
 	// If we're not tracing, this slice will always remain empty.
@@ -1273,7 +1274,7 @@ func (s *connection) handleFrames(
 		if handleErr != nil {
 			continue
 		}
-		if err := s.handleFrame(frame, encLevel, destConnID); err != nil {
+		if err := s.handleFrame(frame, encLevel, destConnID, rcvTime); err != nil {
 			if log == nil {
 				return false, err
 			}
@@ -1302,20 +1303,25 @@ func (s *connection) handleFrames(
 	return
 }
 
-func (s *connection) handleFrame(f wire.Frame, encLevel protocol.EncryptionLevel, destConnID protocol.ConnectionID) error {
+func (s *connection) handleFrame(
+	f wire.Frame,
+	encLevel protocol.EncryptionLevel,
+	destConnID protocol.ConnectionID,
+	rcvTime time.Time,
+) error {
 	var err error
 	wire.LogFrame(s.logger, f, false)
 	switch frame := f.(type) {
 	case *wire.CryptoFrame:
 		err = s.handleCryptoFrame(frame, encLevel)
 	case *wire.StreamFrame:
-		err = s.handleStreamFrame(frame)
+		err = s.handleStreamFrame(frame, rcvTime)
 	case *wire.AckFrame:
 		err = s.handleAckFrame(frame, encLevel)
 	case *wire.ConnectionCloseFrame:
 		s.handleConnectionCloseFrame(frame)
 	case *wire.ResetStreamFrame:
-		err = s.handleResetStreamFrame(frame)
+		err = s.handleResetStreamFrame(frame, rcvTime)
 	case *wire.MaxDataFrame:
 		s.handleMaxDataFrame(frame)
 	case *wire.MaxStreamDataFrame:
@@ -1428,7 +1434,7 @@ func (s *connection) handleHandshakeEvents() error {
 	}
 }
 
-func (s *connection) handleStreamFrame(frame *wire.StreamFrame) error {
+func (s *connection) handleStreamFrame(frame *wire.StreamFrame, rcvTime time.Time) error {
 	str, err := s.streamsMap.GetOrOpenReceiveStream(frame.StreamID)
 	if err != nil {
 		return err
@@ -1438,7 +1444,7 @@ func (s *connection) handleStreamFrame(frame *wire.StreamFrame) error {
 		// ignore this StreamFrame
 		return nil
 	}
-	return str.handleStreamFrame(frame)
+	return str.handleStreamFrame(frame, rcvTime)
 }
 
 func (s *connection) handleMaxDataFrame(frame *wire.MaxDataFrame) {
@@ -1462,7 +1468,7 @@ func (s *connection) handleMaxStreamsFrame(frame *wire.MaxStreamsFrame) {
 	s.streamsMap.HandleMaxStreamsFrame(frame)
 }
 
-func (s *connection) handleResetStreamFrame(frame *wire.ResetStreamFrame) error {
+func (s *connection) handleResetStreamFrame(frame *wire.ResetStreamFrame, rcvTime time.Time) error {
 	str, err := s.streamsMap.GetOrOpenReceiveStream(frame.StreamID)
 	if err != nil {
 		return err
@@ -1471,7 +1477,7 @@ func (s *connection) handleResetStreamFrame(frame *wire.ResetStreamFrame) error 
 		// stream is closed and already garbage collected
 		return nil
 	}
-	return str.handleResetStreamFrame(frame)
+	return str.handleResetStreamFrame(frame, rcvTime)
 }
 
 func (s *connection) handleStopSendingFrame(frame *wire.StopSendingFrame) error {
@@ -1882,7 +1888,7 @@ func (s *connection) sendPackets(now time.Time) error {
 	if isBlocked, offset := s.connFlowController.IsNewlyBlocked(); isBlocked {
 		s.framer.QueueControlFrame(&wire.DataBlockedFrame{MaximumData: offset})
 	}
-	if offset := s.connFlowController.GetWindowUpdate(); offset > 0 {
+	if offset := s.connFlowController.GetWindowUpdate(now); offset > 0 {
 		s.framer.QueueControlFrame(&wire.MaxDataFrame{MaximumData: offset})
 	}
 	if cf := s.cryptoStreamManager.GetPostHandshakeData(protocol.MaxPostHandshakeCryptoFrameSize); cf != nil {
@@ -1890,7 +1896,7 @@ func (s *connection) sendPackets(now time.Time) error {
 	}
 
 	if !s.handshakeConfirmed {
-		packet, err := s.packer.PackCoalescedPacket(false, s.maxPacketSize(), s.version)
+		packet, err := s.packer.PackCoalescedPacket(false, s.maxPacketSize(), now, s.version)
 		if err != nil || packet == nil {
 			return err
 		}
@@ -2017,7 +2023,7 @@ func (s *connection) resetPacingDeadline() {
 func (s *connection) maybeSendAckOnlyPacket(now time.Time) error {
 	if !s.handshakeConfirmed {
 		ecn := s.sentPacketHandler.ECNMode(false)
-		packet, err := s.packer.PackCoalescedPacket(true, s.maxPacketSize(), s.version)
+		packet, err := s.packer.PackCoalescedPacket(true, s.maxPacketSize(), now, s.version)
 		if err != nil {
 			return err
 		}
@@ -2028,7 +2034,7 @@ func (s *connection) maybeSendAckOnlyPacket(now time.Time) error {
 	}
 
 	ecn := s.sentPacketHandler.ECNMode(true)
-	p, buf, err := s.packer.PackAckOnlyPacket(s.maxPacketSize(), s.version)
+	p, buf, err := s.packer.PackAckOnlyPacket(s.maxPacketSize(), now, s.version)
 	if err != nil {
 		if err == errNothingToPack {
 			return nil
@@ -2050,7 +2056,7 @@ func (s *connection) sendProbePacket(encLevel protocol.EncryptionLevel, now time
 			break
 		}
 		var err error
-		packet, err = s.packer.MaybePackProbePacket(encLevel, s.maxPacketSize(), s.version)
+		packet, err = s.packer.MaybePackProbePacket(encLevel, s.maxPacketSize(), now, s.version)
 		if err != nil {
 			return err
 		}
@@ -2061,7 +2067,7 @@ func (s *connection) sendProbePacket(encLevel protocol.EncryptionLevel, now time
 	if packet == nil {
 		s.retransmissionQueue.AddPing(encLevel)
 		var err error
-		packet, err = s.packer.MaybePackProbePacket(encLevel, s.maxPacketSize(), s.version)
+		packet, err = s.packer.MaybePackProbePacket(encLevel, s.maxPacketSize(), now, s.version)
 		if err != nil {
 			return err
 		}
@@ -2076,7 +2082,7 @@ func (s *connection) sendProbePacket(encLevel protocol.EncryptionLevel, now time
 // If there was nothing to pack, the returned size is 0.
 func (s *connection) appendOneShortHeaderPacket(buf *packetBuffer, maxSize protocol.ByteCount, ecn protocol.ECN, now time.Time) (protocol.ByteCount, error) {
 	startLen := buf.Len()
-	p, err := s.packer.AppendPacket(buf, maxSize, s.version)
+	p, err := s.packer.AppendPacket(buf, maxSize, now, s.version)
 	if err != nil {
 		return 0, err
 	}
