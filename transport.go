@@ -241,7 +241,9 @@ func (t *Transport) init(allowZeroLengthConnIDs bool) error {
 
 		t.logger = utils.DefaultLogger // TODO: make this configurable
 		t.conn = conn
-		t.handlerMap = newPacketHandlerMap(t.StatelessResetKey, t.enqueueClosePacket, t.logger)
+		if t.handlerMap == nil { // allows mocking the handlerMap in tests
+			t.handlerMap = newPacketHandlerMap(t.StatelessResetKey, t.enqueueClosePacket, t.logger)
+		}
 		t.listening = make(chan struct{})
 
 		t.closeQueue = make(chan closePacket, 4)
@@ -428,7 +430,12 @@ func (t *Transport) handlePacket(p receivedPacket) {
 		return
 	}
 	if !wire.IsLongHeaderPacket(p.data[0]) {
-		t.maybeSendStatelessReset(p)
+		if statelessResetQueued := t.maybeSendStatelessReset(p); !statelessResetQueued {
+			if t.Tracer != nil && t.Tracer.DroppedPacket != nil {
+				t.Tracer.DroppedPacket(p.remoteAddr, logging.PacketTypeNotDetermined, p.Size(), logging.PacketDropUnknownConnectionID)
+			}
+			p.buffer.Release()
+		}
 		return
 	}
 
@@ -436,29 +443,32 @@ func (t *Transport) handlePacket(p receivedPacket) {
 	defer t.mutex.Unlock()
 	if t.server == nil { // no server set
 		t.logger.Debugf("received a packet with an unexpected connection ID %s", connID)
+		if t.Tracer != nil && t.Tracer.DroppedPacket != nil {
+			t.Tracer.DroppedPacket(p.remoteAddr, logging.PacketTypeNotDetermined, p.Size(), logging.PacketDropUnknownConnectionID)
+		}
+		p.buffer.MaybeRelease()
 		return
 	}
 	t.server.handlePacket(p)
 }
 
-func (t *Transport) maybeSendStatelessReset(p receivedPacket) {
+func (t *Transport) maybeSendStatelessReset(p receivedPacket) (statelessResetQueued bool) {
 	if t.StatelessResetKey == nil {
-		p.buffer.Release()
-		return
+		return false
 	}
 
 	// Don't send a stateless reset in response to very small packets.
 	// This includes packets that could be stateless resets.
 	if len(p.data) <= protocol.MinStatelessResetSize {
-		p.buffer.Release()
-		return
+		return false
 	}
 
 	select {
 	case t.statelessResetQueue <- p:
+		return true
 	default:
 		// it's fine to not send a stateless reset when we're busy
-		p.buffer.Release()
+		return false
 	}
 }
 

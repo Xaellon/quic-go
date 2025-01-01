@@ -499,6 +499,22 @@ func (s *connection) run() error {
 	var closeErr closeError
 	defer func() { s.ctxCancel(closeErr.err) }()
 
+	defer func() {
+		// Drain queued packets that will never be processed.
+		for {
+			select {
+			case p, ok := <-s.receivedPackets:
+				if !ok {
+					return
+				}
+				p.buffer.Decrement()
+				p.buffer.MaybeRelease()
+			default:
+				return
+			}
+		}
+	}()
+
 	s.timer = *newTimer()
 
 	if err := s.cryptoStreamHandler.StartHandshake(s.ctx); err != nil {
@@ -1781,7 +1797,7 @@ func (s *connection) applyTransportParameters() {
 	if params.MaxIdleTimeout > 0 {
 		s.idleTimeout = min(s.idleTimeout, params.MaxIdleTimeout)
 	}
-	s.keepAliveInterval = min(s.config.KeepAlivePeriod, min(s.idleTimeout/2, protocol.MaxKeepAliveInterval))
+	s.keepAliveInterval = min(s.config.KeepAlivePeriod, s.idleTimeout/2)
 	s.streamsMap.UpdateLimits(params)
 	s.frameParser.SetAckDelayExponent(params.AckDelayExponent)
 	s.connFlowController.UpdateSendWindow(params.InitialMaxData)
@@ -2309,17 +2325,8 @@ func (s *connection) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	return s.datagramQueue.Receive(ctx)
 }
 
-func (s *connection) LocalAddr() net.Addr {
-	return s.conn.LocalAddr()
-}
-
-func (s *connection) RemoteAddr() net.Addr {
-	return s.conn.RemoteAddr()
-}
-
-func (s *connection) GetVersion() protocol.Version {
-	return s.version
-}
+func (s *connection) LocalAddr() net.Addr  { return s.conn.LocalAddr() }
+func (s *connection) RemoteAddr() net.Addr { return s.conn.RemoteAddr() }
 
 func (s *connection) NextConnection(ctx context.Context) (Connection, error) {
 	// The handshake might fail after the server rejected 0-RTT.

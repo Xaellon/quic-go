@@ -18,7 +18,7 @@ type sendStreamI interface {
 	SendStream
 	handleStopSendingFrame(*wire.StopSendingFrame)
 	hasData() bool
-	popStreamFrame(maxBytes protocol.ByteCount, v protocol.Version) (frame ackhandler.StreamFrame, ok, hasMore bool)
+	popStreamFrame(maxBytes protocol.ByteCount, v protocol.Version) (frame ackhandler.StreamFrame, hasMore bool)
 	closeForShutdown(error)
 	updateSendWindow(protocol.ByteCount)
 }
@@ -217,7 +217,7 @@ func (s *sendStream) canBufferStreamFrame() bool {
 
 // popStreamFrame returns the next STREAM frame that is supposed to be sent on this stream
 // maxBytes is the maximum length this frame (including frame header) will have.
-func (s *sendStream) popStreamFrame(maxBytes protocol.ByteCount, v protocol.Version) (af ackhandler.StreamFrame, ok, hasMore bool) {
+func (s *sendStream) popStreamFrame(maxBytes protocol.ByteCount, v protocol.Version) (af ackhandler.StreamFrame, hasMore bool) {
 	s.mutex.Lock()
 	f, hasMoreData, queuedControlFrame := s.popNewOrRetransmittedStreamFrame(maxBytes, v)
 	if f != nil {
@@ -229,12 +229,12 @@ func (s *sendStream) popStreamFrame(maxBytes protocol.ByteCount, v protocol.Vers
 		s.sender.onHasStreamControlFrame(s.streamID, s)
 	}
 	if f == nil {
-		return ackhandler.StreamFrame{}, false, hasMoreData
+		return ackhandler.StreamFrame{}, hasMoreData
 	}
 	return ackhandler.StreamFrame{
 		Frame:   f,
 		Handler: (*sendStreamAckHandler)(s),
-	}, true, hasMoreData
+	}, hasMoreData
 }
 
 func (s *sendStream) popNewOrRetransmittedStreamFrame(maxBytes protocol.ByteCount, v protocol.Version) (_ *wire.StreamFrame, hasMoreData, queuedControlFrame bool) {
@@ -277,6 +277,9 @@ func (s *sendStream) popNewOrRetransmittedStreamFrame(maxBytes protocol.ByteCoun
 	}
 
 	f, hasMoreData := s.popNewStreamFrame(maxBytes, sendWindow, v)
+	if f == nil {
+		return nil, hasMoreData, false
+	}
 	if dataLen := f.DataLen(); dataLen > 0 {
 		s.writeOffset += f.DataLen()
 		s.flowController.AddBytesSent(f.DataLen())
@@ -290,10 +293,12 @@ func (s *sendStream) popNewOrRetransmittedStreamFrame(maxBytes protocol.ByteCoun
 
 func (s *sendStream) popNewStreamFrame(maxBytes, sendWindow protocol.ByteCount, v protocol.Version) (*wire.StreamFrame, bool) {
 	if s.nextFrame != nil {
+		maxDataLen := min(sendWindow, s.nextFrame.MaxDataLen(maxBytes, v))
+		if maxDataLen == 0 {
+			return nil, true
+		}
 		nextFrame := s.nextFrame
 		s.nextFrame = nil
-
-		maxDataLen := min(sendWindow, nextFrame.MaxDataLen(maxBytes, v))
 		if nextFrame.DataLen() > maxDataLen {
 			s.nextFrame = wire.GetStreamFrame()
 			s.nextFrame.StreamID = s.streamID
@@ -393,7 +398,7 @@ func (s *sendStream) isNewlyCompleted() bool {
 
 func (s *sendStream) Close() error {
 	s.mutex.Lock()
-	if s.closeForShutdownErr != nil {
+	if s.closeForShutdownErr != nil || s.finishedWriting {
 		s.mutex.Unlock()
 		return nil
 	}
@@ -592,6 +597,7 @@ func (s *sendStreamResetStreamHandler) OnAcked(wire.Frame) {
 func (s *sendStreamResetStreamHandler) OnLost(wire.Frame) {
 	s.mutex.Lock()
 	s.queuedResetStreamFrame = true
+	s.numOutstandingFrames--
 	s.mutex.Unlock()
 	s.sender.onHasStreamControlFrame(s.streamID, (*sendStream)(s))
 }
