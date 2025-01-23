@@ -107,12 +107,11 @@ type sealingManager interface {
 
 type frameSource interface {
 	HasData() bool
-	AppendStreamFrames([]ackhandler.StreamFrame, protocol.ByteCount, protocol.Version) ([]ackhandler.StreamFrame, protocol.ByteCount)
-	AppendControlFrames([]ackhandler.Frame, protocol.ByteCount, time.Time, protocol.Version) ([]ackhandler.Frame, protocol.ByteCount)
+	Append([]ackhandler.Frame, []ackhandler.StreamFrame, protocol.ByteCount, time.Time, protocol.Version) ([]ackhandler.Frame, []ackhandler.StreamFrame, protocol.ByteCount)
 }
 
 type ackFrameSource interface {
-	GetAckFrame(encLevel protocol.EncryptionLevel, onlyIfQueued bool) *wire.AckFrame
+	GetAckFrame(_ protocol.EncryptionLevel, now time.Time, onlyIfQueued bool) *wire.AckFrame
 }
 
 type packetPacker struct {
@@ -343,7 +342,14 @@ func (p *packetPacker) PackCoalescedPacket(onlyAck bool, maxSize protocol.ByteCo
 	}
 	var size protocol.ByteCount
 	if initialSealer != nil {
-		initialHdr, initialPayload = p.maybeGetCryptoPacket(maxSize-protocol.ByteCount(initialSealer.Overhead()), protocol.EncryptionInitial, onlyAck, true, v)
+		initialHdr, initialPayload = p.maybeGetCryptoPacket(
+			maxSize-protocol.ByteCount(initialSealer.Overhead()),
+			protocol.EncryptionInitial,
+			now,
+			onlyAck,
+			true,
+			v,
+		)
 		if initialPayload.length > 0 {
 			size += p.longHeaderPacketLength(initialHdr, initialPayload, v) + protocol.ByteCount(initialSealer.Overhead())
 		}
@@ -358,7 +364,14 @@ func (p *packetPacker) PackCoalescedPacket(onlyAck bool, maxSize protocol.ByteCo
 			return nil, err
 		}
 		if handshakeSealer != nil {
-			handshakeHdr, handshakePayload = p.maybeGetCryptoPacket(maxSize-size-protocol.ByteCount(handshakeSealer.Overhead()), protocol.EncryptionHandshake, onlyAck, size == 0, v)
+			handshakeHdr, handshakePayload = p.maybeGetCryptoPacket(
+				maxSize-size-protocol.ByteCount(handshakeSealer.Overhead()),
+				protocol.EncryptionHandshake,
+				now,
+				onlyAck,
+				size == 0,
+				v,
+			)
 			if handshakePayload.length > 0 {
 				s := p.longHeaderPacketLength(handshakeHdr, handshakePayload, v) + protocol.ByteCount(handshakeSealer.Overhead())
 				size += s
@@ -478,9 +491,15 @@ func (p *packetPacker) appendPacket(
 	return p.appendShortHeaderPacket(buf, connID, pn, pnLen, kp, pl, 0, maxPacketSize, sealer, false, v)
 }
 
-func (p *packetPacker) maybeGetCryptoPacket(maxPacketSize protocol.ByteCount, encLevel protocol.EncryptionLevel, onlyAck, ackAllowed bool, v protocol.Version) (*wire.ExtendedHeader, payload) {
+func (p *packetPacker) maybeGetCryptoPacket(
+	maxPacketSize protocol.ByteCount,
+	encLevel protocol.EncryptionLevel,
+	now time.Time,
+	onlyAck, ackAllowed bool,
+	v protocol.Version,
+) (*wire.ExtendedHeader, payload) {
 	if onlyAck {
-		if ack := p.acks.GetAckFrame(encLevel, true); ack != nil {
+		if ack := p.acks.GetAckFrame(encLevel, now, true); ack != nil {
 			return p.getLongHeader(encLevel, v), payload{
 				ack:    ack,
 				length: ack.Length(v),
@@ -507,7 +526,7 @@ func (p *packetPacker) maybeGetCryptoPacket(maxPacketSize protocol.ByteCount, en
 	hasData := s.HasData()
 	var ack *wire.AckFrame
 	if ackAllowed {
-		ack = p.acks.GetAckFrame(encLevel, !hasRetransmission && !hasData)
+		ack = p.acks.GetAckFrame(encLevel, now, !hasRetransmission && !hasData)
 	}
 	if !hasData && !hasRetransmission && ack == nil {
 		// nothing to send
@@ -611,7 +630,7 @@ func (p *packetPacker) composeNextPacket(
 	v protocol.Version,
 ) payload {
 	if onlyAck {
-		if ack := p.acks.GetAckFrame(protocol.Encryption1RTT, true); ack != nil {
+		if ack := p.acks.GetAckFrame(protocol.Encryption1RTT, now, true); ack != nil {
 			return payload{ack: ack, length: ack.Length(v)}
 		}
 		return payload{}
@@ -623,7 +642,7 @@ func (p *packetPacker) composeNextPacket(
 	var hasAck bool
 	var pl payload
 	if ackAllowed {
-		if ack := p.acks.GetAckFrame(protocol.Encryption1RTT, !hasRetransmission && !hasData); ack != nil {
+		if ack := p.acks.GetAckFrame(protocol.Encryption1RTT, now, !hasRetransmission && !hasData); ack != nil {
 			pl.ack = ack
 			pl.length += ack.Length(v)
 			hasAck = true
@@ -669,7 +688,7 @@ func (p *packetPacker) composeNextPacket(
 	if hasData {
 		var lengthAdded protocol.ByteCount
 		startLen := len(pl.frames)
-		pl.frames, lengthAdded = p.framer.AppendControlFrames(pl.frames, maxFrameSize-pl.length, now, v)
+		pl.frames, pl.streamFrames, lengthAdded = p.framer.Append(pl.frames, pl.streamFrames, maxFrameSize-pl.length, now, v)
 		pl.length += lengthAdded
 		// add handlers for the control frames that were added
 		for i := startLen; i < len(pl.frames); i++ {
@@ -684,9 +703,6 @@ func (p *packetPacker) composeNextPacket(
 				pl.frames[i].Handler = p.retransmissionQueue.AppDataAckHandler()
 			}
 		}
-
-		pl.streamFrames, lengthAdded = p.framer.AppendStreamFrames(pl.streamFrames, maxFrameSize-pl.length, v)
-		pl.length += lengthAdded
 	}
 	return pl
 }
@@ -738,7 +754,7 @@ func (p *packetPacker) MaybePackProbePacket(
 	default:
 		panic("unknown encryption level")
 	}
-	hdr, pl := p.maybeGetCryptoPacket(maxPacketSize-protocol.ByteCount(sealer.Overhead()), encLevel, false, true, v)
+	hdr, pl := p.maybeGetCryptoPacket(maxPacketSize-protocol.ByteCount(sealer.Overhead()), encLevel, now, false, true, v)
 	if pl.length == 0 {
 		return nil, nil
 	}

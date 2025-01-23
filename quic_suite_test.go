@@ -2,6 +2,7 @@ package quic
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -9,7 +10,6 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -28,9 +28,6 @@ var mockCtrl *gomock.Controller
 
 var _ = BeforeEach(func() {
 	mockCtrl = gomock.NewController(GinkgoT())
-
-	// reset the sync.Once
-	connMuxerOnce = *new(sync.Once)
 })
 
 var _ = BeforeSuite(func() {
@@ -59,6 +56,12 @@ func newUPDConnLocalhost(t testing.TB) *net.UDPConn {
 	return conn
 }
 
+func areConnsRunning() bool {
+	var b bytes.Buffer
+	pprof.Lookup("goroutine").WriteTo(&b, 1)
+	return strings.Contains(b.String(), "quic-go.(*connection).run")
+}
+
 func areServersRunning() bool {
 	var b bytes.Buffer
 	pprof.Lookup("goroutine").WriteTo(&b, 1)
@@ -76,3 +79,19 @@ var _ = AfterEach(func() {
 	Eventually(areServersRunning).Should(BeFalse())
 	Eventually(areTransportsRunning()).Should(BeFalse())
 })
+
+func TestMain(m *testing.M) {
+	status := m.Run()
+	if status != 0 {
+		os.Exit(status)
+	}
+	if areConnsRunning() {
+		fmt.Println("stray connection goroutines found")
+		os.Exit(1)
+	}
+	if areTransportsRunning() {
+		fmt.Println("stray transport goroutines found")
+		os.Exit(1)
+	}
+	os.Exit(status)
+}
