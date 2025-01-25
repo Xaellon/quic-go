@@ -848,16 +848,17 @@ func TestHTTP0RTT(t *testing.T) {
 	port := startHTTPServer(t, mux)
 
 	var num0RTTPackets atomic.Uint32
-	proxy, err := quicproxy.NewQuicProxy("localhost:0", &quicproxy.Opts{
-		RemoteAddr: fmt.Sprintf("localhost:%d", port),
+	proxy := quicproxy.Proxy{
+		Conn:       newUPDConnLocalhost(t),
+		ServerAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port},
 		DelayPacket: func(_ quicproxy.Direction, data []byte) time.Duration {
 			if contains0RTTPacket(data) {
 				num0RTTPackets.Add(1)
 			}
 			return scaleDuration(25 * time.Millisecond)
 		},
-	})
-	require.NoError(t, err)
+	}
+	require.NoError(t, proxy.Start())
 	defer proxy.Close()
 
 	tlsConf := getTLSClientConfigWithoutServerName()
@@ -870,7 +871,8 @@ func TestHTTP0RTT(t *testing.T) {
 	}
 	defer tr.Close()
 
-	req, err := http.NewRequest(http3.MethodGet0RTT, fmt.Sprintf("https://localhost:%d/0rtt", proxy.LocalPort()), nil)
+	proxyPort := proxy.LocalAddr().(*net.UDPAddr).Port
+	req, err := http.NewRequest(http3.MethodGet0RTT, fmt.Sprintf("https://localhost:%d/0rtt", proxyPort), nil)
 	require.NoError(t, err)
 	rsp, err := tr.RoundTrip(req)
 	require.NoError(t, err)

@@ -3,7 +3,6 @@ package self_test
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"math"
 	"net"
@@ -204,23 +203,18 @@ func runMITMTest(t *testing.T, serverTr, clientTr *quic.Transport, rtt time.Dura
 	require.NoError(t, err)
 	defer ln.Close()
 
-	serverPort := ln.Addr().(*net.UDPAddr).Port
-	proxy, err := quicproxy.NewQuicProxy("localhost:0", &quicproxy.Opts{
-		RemoteAddr:  fmt.Sprintf("localhost:%d", serverPort),
-		DelayPacket: func(dir quicproxy.Direction, b []byte) time.Duration { return rtt / 2 },
+	proxy := quicproxy.Proxy{
+		Conn:        newUPDConnLocalhost(t),
+		ServerAddr:  ln.Addr().(*net.UDPAddr),
+		DelayPacket: func(_ quicproxy.Direction, b []byte) time.Duration { return rtt / 2 },
 		DropPacket:  dropCb,
-	})
-	require.NoError(t, err)
+	}
+	require.NoError(t, proxy.Start())
 	defer proxy.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), scaleDuration(time.Second))
 	defer cancel()
-	conn, err := clientTr.Dial(
-		ctx,
-		&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: proxy.LocalPort()},
-		getTLSClientConfig(),
-		getQuicConfig(nil),
-	)
+	conn, err := clientTr.Dial(ctx, proxy.LocalAddr(), getTLSClientConfig(), getQuicConfig(nil))
 	require.NoError(t, err)
 	defer conn.CloseWithError(0, "")
 
@@ -418,22 +412,17 @@ func runMITMTestSuccessful(t *testing.T, serverTransport, clientTransport *quic.
 	require.NoError(t, err)
 	defer ln.Close()
 
-	serverPort := ln.Addr().(*net.UDPAddr).Port
-	proxy, err := quicproxy.NewQuicProxy("localhost:0", &quicproxy.Opts{
-		RemoteAddr:  fmt.Sprintf("localhost:%d", serverPort),
+	proxy := quicproxy.Proxy{
+		Conn:        newUPDConnLocalhost(t),
+		ServerAddr:  ln.Addr().(*net.UDPAddr),
 		DelayPacket: delayCb,
-	})
-	require.NoError(t, err)
+	}
+	require.NoError(t, proxy.Start())
 	defer proxy.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), scaleDuration(50*time.Millisecond))
 	defer cancel()
-	_, err = clientTransport.Dial(
-		ctx,
-		&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: proxy.LocalPort()},
-		getTLSClientConfig(),
-		getQuicConfig(nil),
-	)
+	_, err = clientTransport.Dial(ctx, proxy.LocalAddr(), getTLSClientConfig(), getQuicConfig(nil))
 	require.Error(t, err)
 	return err
 }
