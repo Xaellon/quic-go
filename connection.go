@@ -95,7 +95,6 @@ type connRunner interface {
 
 type closeError struct {
 	err       error
-	remote    bool
 	immediate bool
 }
 
@@ -159,9 +158,9 @@ type connection struct {
 	receivedPackets  chan receivedPacket
 	sendingScheduled chan struct{}
 
-	closeOnce sync.Once
 	// closeChan is used to notify the run loop that it should terminate
-	closeChan chan closeError
+	closeChan chan struct{}
+	closeErr  atomic.Pointer[closeError]
 
 	ctx                   context.Context
 	ctxCancel             context.CancelCauseFunc
@@ -483,7 +482,7 @@ func (s *connection) preSetup() {
 	)
 	s.framer = newFramer(s.connFlowController)
 	s.receivedPackets = make(chan receivedPacket, protocol.MaxConnUnprocessedPackets)
-	s.closeChan = make(chan closeError, 1)
+	s.closeChan = make(chan struct{}, 1)
 	s.sendingScheduled = make(chan struct{}, 1)
 	s.handshakeCompleteChan = make(chan struct{})
 
@@ -496,9 +495,8 @@ func (s *connection) preSetup() {
 }
 
 // run the connection main loop
-func (s *connection) run() error {
-	var closeErr closeError
-	defer func() { s.ctxCancel(closeErr.err) }()
+func (s *connection) run() (err error) {
+	defer func() { s.ctxCancel(err) }()
 
 	defer func() {
 		// Drain queued packets that will never be processed.
@@ -539,11 +537,12 @@ func (s *connection) run() error {
 runLoop:
 	for {
 		if s.framer.QueuedTooManyControlFrames() {
-			s.closeLocal(&qerr.TransportError{ErrorCode: InternalError})
+			s.setCloseError(&closeError{err: &qerr.TransportError{ErrorCode: InternalError}})
+			break runLoop
 		}
 		// Close immediately if requested
 		select {
-		case closeErr = <-s.closeChan:
+		case <-s.closeChan:
 			break runLoop
 		default:
 		}
@@ -555,21 +554,20 @@ runLoop:
 			queue := s.undecryptablePacketsToProcess
 			s.undecryptablePacketsToProcess = nil
 			for _, p := range queue {
-				if processed := s.handlePacketImpl(p); processed {
-					processedUndecryptablePacket = true
-				}
-				// Don't set timers and send packets if the packet made us close the connection.
-				select {
-				case closeErr = <-s.closeChan:
+				processed, err := s.handleOnePacket(p)
+				if err != nil {
+					s.setCloseError(&closeError{err: err})
 					break runLoop
-				default:
+				}
+				if processed {
+					processedUndecryptablePacket = true
 				}
 			}
 		}
 		// If we processed any undecryptable packets, jump to the resetting of the timers directly.
 		if !processedUndecryptablePacket {
 			select {
-			case closeErr = <-s.closeChan:
+			case <-s.closeChan:
 				break runLoop
 			case <-s.timer.Chan():
 				s.timer.SetRead()
@@ -580,34 +578,10 @@ runLoop:
 				// nothing to see here.
 			case <-sendQueueAvailable:
 			case firstPacket := <-s.receivedPackets:
-				wasProcessed := s.handlePacketImpl(firstPacket)
-				// Don't set timers and send packets if the packet made us close the connection.
-				select {
-				case closeErr = <-s.closeChan:
+				wasProcessed, err := s.handlePackets(firstPacket)
+				if err != nil {
+					s.setCloseError(&closeError{err: err})
 					break runLoop
-				default:
-				}
-				if s.handshakeComplete {
-					// Now process all packets in the receivedPackets channel.
-					// Limit the number of packets to the length of the receivedPackets channel,
-					// so we eventually get a chance to send out an ACK when receiving a lot of packets.
-					numPackets := len(s.receivedPackets)
-				receiveLoop:
-					for i := 0; i < numPackets; i++ {
-						select {
-						case p := <-s.receivedPackets:
-							if processed := s.handlePacketImpl(p); processed {
-								wasProcessed = true
-							}
-							select {
-							case closeErr = <-s.closeChan:
-								break runLoop
-							default:
-							}
-						default:
-							break receiveLoop
-						}
-					}
 				}
 				// Only reset the timers if this packet was actually processed.
 				// This avoids modifying any state when handling undecryptable packets,
@@ -623,7 +597,8 @@ runLoop:
 			// This could cause packets to be retransmitted.
 			// Check it before trying to send packets.
 			if err := s.sentPacketHandler.OnLossDetectionTimeout(now); err != nil {
-				s.closeLocal(err)
+				s.setCloseError(&closeError{err: err})
+				break runLoop
 			}
 		}
 
@@ -634,13 +609,13 @@ runLoop:
 			s.keepAlivePingSent = true
 		} else if !s.handshakeComplete && now.Sub(s.creationTime) >= s.config.handshakeTimeout() {
 			s.destroyImpl(qerr.ErrHandshakeTimeout)
-			continue
+			break runLoop
 		} else {
 			idleTimeoutStartTime := s.idleTimeoutStartTime()
 			if (!s.handshakeComplete && now.Sub(idleTimeoutStartTime) >= s.config.HandshakeIdleTimeout) ||
 				(s.handshakeComplete && now.After(s.nextIdleTimeoutTime())) {
 				s.destroyImpl(qerr.ErrIdleTimeout)
-				continue
+				break runLoop
 			}
 		}
 
@@ -650,8 +625,14 @@ runLoop:
 			sendQueueAvailable = s.sendQueue.Available()
 			continue
 		}
+
+		if s.closeErr.Load() != nil {
+			break runLoop
+		}
+
 		if err := s.triggerSending(now); err != nil {
-			s.closeLocal(err)
+			s.setCloseError(&closeError{err: err})
+			break runLoop
 		}
 		if s.sendQueue.WouldBlock() {
 			sendQueueAvailable = s.sendQueue.Available()
@@ -660,9 +641,10 @@ runLoop:
 		}
 	}
 
+	closeErr := s.closeErr.Load()
 	s.cryptoStreamHandler.Close()
 	s.sendQueue.Close() // close the send queue before sending the CONNECTION_CLOSE
-	s.handleCloseError(&closeErr)
+	s.handleCloseError(closeErr)
 	if s.tracer != nil && s.tracer.Close != nil {
 		if e := (&errCloseForRecreating{}); !errors.As(closeErr.err, &e) {
 			s.tracer.Close()
@@ -805,17 +787,47 @@ func (s *connection) handleHandshakeConfirmed(now time.Time) error {
 	return nil
 }
 
-func (s *connection) handlePacketImpl(rp receivedPacket) bool {
+func (s *connection) handlePackets(firstPacket receivedPacket) (wasProcessed bool, _ error) {
+	wasProcessed, err := s.handleOnePacket(firstPacket)
+	if err != nil {
+		return false, err
+	}
+	// only process a single packet at a time before handshake completion
+	if !s.handshakeComplete {
+		return wasProcessed, nil
+	}
+	// Now process all packets in the receivedPackets channel.
+	// Limit the number of packets to the length of the receivedPackets channel,
+	// so we eventually get a chance to send out an ACK when receiving a lot of packets.
+	numPackets := len(s.receivedPackets)
+receiveLoop:
+	for i := 0; i < numPackets; i++ {
+		select {
+		case p := <-s.receivedPackets:
+			processed, err := s.handleOnePacket(p)
+			if err != nil {
+				return false, err
+			}
+			if processed {
+				wasProcessed = true
+			}
+		default:
+			break receiveLoop
+		}
+	}
+	return wasProcessed, nil
+}
+
+func (s *connection) handleOnePacket(rp receivedPacket) (wasProcessed bool, _ error) {
 	s.sentPacketHandler.ReceivedBytes(rp.Size(), rp.rcvTime)
 
 	if wire.IsVersionNegotiationPacket(rp.data) {
 		s.handleVersionNegotiationPacket(rp)
-		return false
+		return false, nil
 	}
 
 	var counter uint8
 	var lastConnID protocol.ConnectionID
-	var processed bool
 	data := rp.data
 	p := rp
 	for len(data) > 0 {
@@ -875,26 +887,34 @@ func (s *connection) handlePacketImpl(rp receivedPacket) bool {
 
 			p.data = packetData
 
-			if wasProcessed := s.handleLongHeaderPacket(p, hdr); wasProcessed {
-				processed = true
+			processed, err := s.handleLongHeaderPacket(p, hdr)
+			if err != nil {
+				return false, err
+			}
+			if processed {
+				wasProcessed = true
 			}
 			data = rest
 		} else {
 			if counter > 0 {
 				p.buffer.Split()
 			}
-			if wasProcessed := s.handleShortHeaderPacket(p); wasProcessed {
-				processed = true
+			processed, err := s.handleShortHeaderPacket(p)
+			if err != nil {
+				return false, err
+			}
+			if processed {
+				wasProcessed = true
 			}
 			break
 		}
 	}
 
 	p.buffer.MaybeRelease()
-	return processed
+	return wasProcessed, nil
 }
 
-func (s *connection) handleShortHeaderPacket(p receivedPacket) bool {
+func (s *connection) handleShortHeaderPacket(p receivedPacket) (wasProcessed bool, _ error) {
 	var wasQueued bool
 
 	defer func() {
@@ -907,12 +927,12 @@ func (s *connection) handleShortHeaderPacket(p receivedPacket) bool {
 	destConnID, err := wire.ParseConnectionID(p.data, s.srcConnIDLen)
 	if err != nil {
 		s.tracer.DroppedPacket(logging.PacketType1RTT, protocol.InvalidPacketNumber, protocol.ByteCount(len(p.data)), logging.PacketDropHeaderParseError)
-		return false
+		return false, nil
 	}
 	pn, pnLen, keyPhase, data, err := s.unpacker.UnpackShortHeader(p.rcvTime, p.data)
 	if err != nil {
-		wasQueued = s.handleUnpackError(err, p, logging.PacketType1RTT)
-		return false
+		wasQueued, err = s.handleUnpackError(err, p, logging.PacketType1RTT)
+		return false, err
 	}
 
 	if s.logger.Debug() {
@@ -925,7 +945,7 @@ func (s *connection) handleShortHeaderPacket(p receivedPacket) bool {
 		if s.tracer != nil && s.tracer.DroppedPacket != nil {
 			s.tracer.DroppedPacket(logging.PacketType1RTT, pn, p.Size(), logging.PacketDropDuplicate)
 		}
-		return false
+		return false, nil
 	}
 
 	var log func([]logging.Frame)
@@ -945,13 +965,12 @@ func (s *connection) handleShortHeaderPacket(p receivedPacket) bool {
 		}
 	}
 	if err := s.handleUnpackedShortHeaderPacket(destConnID, pn, data, p.ecn, p.rcvTime, log); err != nil {
-		s.closeLocal(err)
-		return false
+		return false, err
 	}
-	return true
+	return true, nil
 }
 
-func (s *connection) handleLongHeaderPacket(p receivedPacket, hdr *wire.Header) bool /* was the packet successfully processed */ {
+func (s *connection) handleLongHeaderPacket(p receivedPacket, hdr *wire.Header) (wasProcessed bool, _ error) {
 	var wasQueued bool
 
 	defer func() {
@@ -962,7 +981,7 @@ func (s *connection) handleLongHeaderPacket(p receivedPacket, hdr *wire.Header) 
 	}()
 
 	if hdr.Type == protocol.PacketTypeRetry {
-		return s.handleRetryPacket(hdr, p.data, p.rcvTime)
+		return s.handleRetryPacket(hdr, p.data, p.rcvTime), nil
 	}
 
 	// The server can change the source connection ID with the first Handshake packet.
@@ -972,20 +991,20 @@ func (s *connection) handleLongHeaderPacket(p receivedPacket, hdr *wire.Header) 
 			s.tracer.DroppedPacket(logging.PacketTypeInitial, protocol.InvalidPacketNumber, p.Size(), logging.PacketDropUnknownConnectionID)
 		}
 		s.logger.Debugf("Dropping Initial packet (%d bytes) with unexpected source connection ID: %s (expected %s)", p.Size(), hdr.SrcConnectionID, s.handshakeDestConnID)
-		return false
+		return false, nil
 	}
 	// drop 0-RTT packets, if we are a client
 	if s.perspective == protocol.PerspectiveClient && hdr.Type == protocol.PacketType0RTT {
 		if s.tracer != nil && s.tracer.DroppedPacket != nil {
 			s.tracer.DroppedPacket(logging.PacketType0RTT, protocol.InvalidPacketNumber, p.Size(), logging.PacketDropUnexpectedPacket)
 		}
-		return false
+		return false, nil
 	}
 
 	packet, err := s.unpacker.UnpackLongHeader(hdr, p.data)
 	if err != nil {
-		wasQueued = s.handleUnpackError(err, p, logging.PacketTypeFromHeader(hdr))
-		return false
+		wasQueued, err = s.handleUnpackError(err, p, logging.PacketTypeFromHeader(hdr))
+		return false, err
 	}
 
 	if s.logger.Debug() {
@@ -998,39 +1017,40 @@ func (s *connection) handleLongHeaderPacket(p receivedPacket, hdr *wire.Header) 
 		if s.tracer != nil && s.tracer.DroppedPacket != nil {
 			s.tracer.DroppedPacket(logging.PacketTypeFromHeader(hdr), pn, p.Size(), logging.PacketDropDuplicate)
 		}
-		return false
+		return false, nil
 	}
 
 	if err := s.handleUnpackedLongHeaderPacket(packet, p.ecn, p.rcvTime, p.Size()); err != nil {
-		s.closeLocal(err)
-		return false
+		return false, err
 	}
-	return true
+	return true, nil
 }
 
-func (s *connection) handleUnpackError(err error, p receivedPacket, pt logging.PacketType) (wasQueued bool) {
+func (s *connection) handleUnpackError(err error, p receivedPacket, pt logging.PacketType) (wasQueued bool, _ error) {
 	switch err {
 	case handshake.ErrKeysDropped:
 		if s.tracer != nil && s.tracer.DroppedPacket != nil {
 			s.tracer.DroppedPacket(pt, protocol.InvalidPacketNumber, p.Size(), logging.PacketDropKeyUnavailable)
 		}
 		s.logger.Debugf("Dropping %s packet (%d bytes) because we already dropped the keys.", pt, p.Size())
+		return false, nil
 	case handshake.ErrKeysNotYetAvailable:
 		// Sealer for this encryption level not yet available.
 		// Try again later.
 		s.tryQueueingUndecryptablePacket(p, pt)
-		return true
+		return true, nil
 	case wire.ErrInvalidReservedBits:
-		s.closeLocal(&qerr.TransportError{
+		return false, &qerr.TransportError{
 			ErrorCode:    qerr.ProtocolViolation,
 			ErrorMessage: err.Error(),
-		})
+		}
 	case handshake.ErrDecryptionFailed:
 		// This might be a packet injected by an attacker. Drop it.
 		if s.tracer != nil && s.tracer.DroppedPacket != nil {
 			s.tracer.DroppedPacket(pt, protocol.InvalidPacketNumber, p.Size(), logging.PacketDropPayloadDecryptError)
 		}
 		s.logger.Debugf("Dropping %s packet (%d bytes) that could not be unpacked. Error: %s", pt, p.Size(), err)
+		return false, nil
 	default:
 		var headerErr *headerParseError
 		if errors.As(err, &headerErr) {
@@ -1039,13 +1059,12 @@ func (s *connection) handleUnpackError(err error, p receivedPacket, pt logging.P
 				s.tracer.DroppedPacket(pt, protocol.InvalidPacketNumber, p.Size(), logging.PacketDropHeaderParseError)
 			}
 			s.logger.Debugf("Dropping %s packet (%d bytes) for which we couldn't unpack the header. Error: %s", pt, p.Size(), err)
-		} else {
-			// This is an error returned by the AEAD (other than ErrDecryptionFailed).
-			// For example, a PROTOCOL_VIOLATION due to key updates.
-			s.closeLocal(err)
+			return false, nil
 		}
+		// This is an error returned by the AEAD (other than ErrDecryptionFailed).
+		// For example, a PROTOCOL_VIOLATION due to key updates.
+		return false, err
 	}
-	return false
 }
 
 func (s *connection) handleRetryPacket(hdr *wire.Header, data []byte, rcvTime time.Time) bool /* was this a valid Retry */ {
@@ -1334,7 +1353,7 @@ func (s *connection) handleFrame(
 	case *wire.AckFrame:
 		err = s.handleAckFrame(frame, encLevel, rcvTime)
 	case *wire.ConnectionCloseFrame:
-		s.handleConnectionCloseFrame(frame)
+		err = s.handleConnectionCloseFrame(frame)
 	case *wire.ResetStreamFrame:
 		err = s.handleResetStreamFrame(frame, rcvTime)
 	case *wire.MaxDataFrame:
@@ -1387,21 +1406,20 @@ func (s *connection) handlePacket(p receivedPacket) {
 	}
 }
 
-func (s *connection) handleConnectionCloseFrame(frame *wire.ConnectionCloseFrame) {
+func (s *connection) handleConnectionCloseFrame(frame *wire.ConnectionCloseFrame) error {
 	if frame.IsApplicationError {
-		s.closeRemote(&qerr.ApplicationError{
+		return &qerr.ApplicationError{
 			Remote:       true,
 			ErrorCode:    qerr.ApplicationErrorCode(frame.ErrorCode),
 			ErrorMessage: frame.ReasonPhrase,
-		})
-		return
+		}
 	}
-	s.closeRemote(&qerr.TransportError{
+	return &qerr.TransportError{
 		Remote:       true,
 		ErrorCode:    qerr.TransportErrorCode(frame.ErrorCode),
 		FrameType:    frame.FrameType,
 		ErrorMessage: frame.ReasonPhrase,
-	})
+	}
 }
 
 func (s *connection) handleCryptoFrame(frame *wire.CryptoFrame, encLevel protocol.EncryptionLevel, rcvTime time.Time) error {
@@ -1585,16 +1603,17 @@ func (s *connection) handleDatagramFrame(f *wire.DatagramFrame) error {
 	return nil
 }
 
+func (s *connection) setCloseError(e *closeError) {
+	s.closeErr.CompareAndSwap(nil, e)
+	select {
+	case s.closeChan <- struct{}{}:
+	default:
+	}
+}
+
 // closeLocal closes the connection and send a CONNECTION_CLOSE containing the error
 func (s *connection) closeLocal(e error) {
-	s.closeOnce.Do(func() {
-		if e == nil {
-			s.logger.Infof("Closing connection.")
-		} else {
-			s.logger.Errorf("Closing connection with error: %s", e)
-		}
-		s.closeChan <- closeError{err: e, immediate: false, remote: false}
-	})
+	s.setCloseError(&closeError{err: e, immediate: false})
 }
 
 // destroy closes the connection without sending the error on the wire
@@ -1604,21 +1623,7 @@ func (s *connection) destroy(e error) {
 }
 
 func (s *connection) destroyImpl(e error) {
-	s.closeOnce.Do(func() {
-		if nerr, ok := e.(net.Error); ok && nerr.Timeout() {
-			s.logger.Errorf("Destroying connection: %s", e)
-		} else {
-			s.logger.Errorf("Destroying connection with error: %s", e)
-		}
-		s.closeChan <- closeError{err: e, immediate: true, remote: false}
-	})
-}
-
-func (s *connection) closeRemote(e error) {
-	s.closeOnce.Do(func() {
-		s.logger.Errorf("Peer closed connection with error: %s", e)
-		s.closeChan <- closeError{err: e, immediate: true, remote: true}
-	})
+	s.setCloseError(&closeError{err: e, immediate: true})
 }
 
 func (s *connection) CloseWithError(code ApplicationErrorCode, desc string) error {
@@ -1636,13 +1641,25 @@ func (s *connection) closeWithTransportError(code TransportErrorCode) {
 }
 
 func (s *connection) handleCloseError(closeErr *closeError) {
+	if closeErr.immediate {
+		if nerr, ok := closeErr.err.(net.Error); ok && nerr.Timeout() {
+			s.logger.Errorf("Destroying connection: %s", closeErr.err)
+		} else {
+			s.logger.Errorf("Destroying connection with error: %s", closeErr.err)
+		}
+	} else {
+		if closeErr.err == nil {
+			s.logger.Infof("Closing connection.")
+		} else {
+			s.logger.Errorf("Closing connection with error: %s", closeErr.err)
+		}
+	}
+
 	e := closeErr.err
 	if e == nil {
 		e = &qerr.ApplicationError{}
 	} else {
-		defer func() {
-			closeErr.err = e
-		}()
+		defer func() { closeErr.err = e }()
 	}
 
 	var (
@@ -1652,14 +1669,17 @@ func (s *connection) handleCloseError(closeErr *closeError) {
 		applicationErr        *ApplicationError
 		transportErr          *TransportError
 	)
+	var isRemoteClose bool
 	switch {
 	case errors.Is(e, qerr.ErrIdleTimeout),
 		errors.Is(e, qerr.ErrHandshakeTimeout),
 		errors.As(e, &statelessResetErr),
 		errors.As(e, &versionNegotiationErr),
-		errors.As(e, &recreateErr),
-		errors.As(e, &applicationErr),
-		errors.As(e, &transportErr):
+		errors.As(e, &recreateErr):
+	case errors.As(e, &applicationErr):
+		isRemoteClose = applicationErr.Remote
+	case errors.As(e, &transportErr):
+		isRemoteClose = transportErr.Remote
 	case closeErr.immediate:
 		e = closeErr.err
 	default:
@@ -1685,7 +1705,7 @@ func (s *connection) handleCloseError(closeErr *closeError) {
 	}
 
 	// If this is a remote close we're done here
-	if closeErr.remote {
+	if isRemoteClose {
 		s.connIDGenerator.ReplaceWithClosed(nil)
 		return
 	}
