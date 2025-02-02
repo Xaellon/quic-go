@@ -20,6 +20,7 @@ import (
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/qerr"
 	"github.com/quic-go/quic-go/internal/utils"
+	"github.com/quic-go/quic-go/internal/utils/ringbuffer"
 	"github.com/quic-go/quic-go/internal/wire"
 	"github.com/quic-go/quic-go/logging"
 )
@@ -148,15 +149,17 @@ type connection struct {
 	packer        packer
 	mtuDiscoverer mtuDiscoverer // initialized when the transport parameters are received
 
-	maxPayloadSizeEstimate atomic.Uint32
+	currentMTUEstimate atomic.Uint32
 
 	initialStream       *cryptoStream
 	handshakeStream     *cryptoStream
 	oneRTTStream        *cryptoStream // only set for the server
 	cryptoStreamHandler cryptoStreamHandler
 
-	receivedPackets  chan receivedPacket
-	sendingScheduled chan struct{}
+	notifyReceivedPacket chan struct{}
+	sendingScheduled     chan struct{}
+	receivedPacketMx     sync.Mutex
+	receivedPackets      ringbuffer.RingBuffer[receivedPacket]
 
 	// closeChan is used to notify the run loop that it should terminate
 	closeChan chan struct{}
@@ -281,7 +284,7 @@ var newConnection = func(
 		s.tracer,
 		s.logger,
 	)
-	s.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
+	s.currentMTUEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
 	statelessResetToken := statelessResetter.GetStatelessResetToken(srcConnID)
 	params := &wire.TransportParameters{
 		InitialMaxStreamDataBidiLocal:   protocol.ByteCount(s.config.InitialStreamReceiveWindow),
@@ -394,7 +397,7 @@ var newClientConnection = func(
 		s.tracer,
 		s.logger,
 	)
-	s.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
+	s.currentMTUEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
 	oneRTTStream := newCryptoStream()
 	params := &wire.TransportParameters{
 		InitialMaxStreamDataBidiRemote: protocol.ByteCount(s.config.InitialStreamReceiveWindow),
@@ -481,7 +484,8 @@ func (s *connection) preSetup() {
 		s.perspective,
 	)
 	s.framer = newFramer(s.connFlowController)
-	s.receivedPackets = make(chan receivedPacket, protocol.MaxConnUnprocessedPackets)
+	s.receivedPackets.Init(8)
+	s.notifyReceivedPacket = make(chan struct{}, 1)
 	s.closeChan = make(chan struct{}, 1)
 	s.sendingScheduled = make(chan struct{}, 1)
 	s.handshakeCompleteChan = make(chan struct{})
@@ -499,18 +503,14 @@ func (s *connection) run() (err error) {
 	defer func() { s.ctxCancel(err) }()
 
 	defer func() {
-		// Drain queued packets that will never be processed.
-		for {
-			select {
-			case p, ok := <-s.receivedPackets:
-				if !ok {
-					return
-				}
-				p.buffer.Decrement()
-				p.buffer.MaybeRelease()
-			default:
-				return
-			}
+		// drain queued packets that will never be processed
+		s.receivedPacketMx.Lock()
+		defer s.receivedPacketMx.Unlock()
+
+		for !s.receivedPackets.Empty() {
+			p := s.receivedPackets.PopFront()
+			p.buffer.Decrement()
+			p.buffer.MaybeRelease()
 		}
 	}()
 
@@ -547,10 +547,15 @@ runLoop:
 		default:
 		}
 
-		s.maybeResetTimer()
+		// no need to set a timer if we can send packets immediately
+		if s.pacingDeadline != deadlineSendImmediately {
+			s.maybeResetTimer()
+		}
 
-		var processedUndecryptablePacket bool
+		// 1st: handle undecryptable packets, if any.
+		// This can only occur before completion of the handshake.
 		if len(s.undecryptablePacketsToProcess) > 0 {
+			var processedUndecryptablePacket bool
 			queue := s.undecryptablePacketsToProcess
 			s.undecryptablePacketsToProcess = nil
 			for _, p := range queue {
@@ -563,39 +568,54 @@ runLoop:
 					processedUndecryptablePacket = true
 				}
 			}
+			if processedUndecryptablePacket {
+				// if we processed any undecryptable packets, jump to the resetting of the timers directly
+				continue
+			}
 		}
-		// If we processed any undecryptable packets, jump to the resetting of the timers directly.
-		if !processedUndecryptablePacket {
+
+		// 2nd: receive packets.
+		processed, err := s.handlePackets() // don't check receivedPackets.Len() in the run loop to avoid locking the mutex
+		if err != nil {
+			s.setCloseError(&closeError{err: err})
+			break runLoop
+		}
+
+		// We don't need to wait for new events if:
+		// * we processed packets: we probably need to send an ACK, and potentially more data
+		// * the pacer allows us to send more packets immediately
+		shouldProceedImmediately := sendQueueAvailable == nil && (processed || s.pacingDeadline == deadlineSendImmediately)
+		if !shouldProceedImmediately {
+			// 3rd: wait for something to happen:
+			// * closing of the connection
+			// * timer firing
+			// * sending scheduled
+			// * send queue available
+			// * received packets
 			select {
 			case <-s.closeChan:
 				break runLoop
 			case <-s.timer.Chan():
 				s.timer.SetRead()
-				// We do all the interesting stuff after the switch statement, so
-				// nothing to see here.
 			case <-s.sendingScheduled:
-				// We do all the interesting stuff after the switch statement, so
-				// nothing to see here.
 			case <-sendQueueAvailable:
-			case firstPacket := <-s.receivedPackets:
-				wasProcessed, err := s.handlePackets(firstPacket)
+			case <-s.notifyReceivedPacket:
+				wasProcessed, err := s.handlePackets()
 				if err != nil {
 					s.setCloseError(&closeError{err: err})
 					break runLoop
 				}
-				// Only reset the timers if this packet was actually processed.
-				// This avoids modifying any state when handling undecryptable packets,
-				// which could be injected by an attacker.
+				// if we processed any undecryptable packets, jump to the resetting of the timers directly
 				if !wasProcessed {
 					continue
 				}
 			}
 		}
 
+		// Check for loss detection timeout.
+		// This could cause packets to be declared lost, and retransmissions to be enqueued.
 		now := time.Now()
 		if timeout := s.sentPacketHandler.GetLossDetectionTimeout(); !timeout.IsZero() && timeout.Before(now) {
-			// This could cause packets to be retransmitted.
-			// Check it before trying to send packets.
 			if err := s.sentPacketHandler.OnLossDetectionTimeout(now); err != nil {
 				s.setCloseError(&closeError{err: err})
 				break runLoop
@@ -620,9 +640,10 @@ runLoop:
 		}
 
 		if s.sendQueue.WouldBlock() {
-			// The send queue is still busy sending out packets.
-			// Wait until there's space to enqueue new packets.
+			// The send queue is still busy sending out packets. Wait until there's space to enqueue new packets.
 			sendQueueAvailable = s.sendQueue.Available()
+			// Cancel the pacing timer, as we can't send any more packets until the send queue is available again.
+			s.pacingDeadline = time.Time{}
 			continue
 		}
 
@@ -635,7 +656,10 @@ runLoop:
 			break runLoop
 		}
 		if s.sendQueue.WouldBlock() {
+			// The send queue is still busy sending out packets. Wait until there's space to enqueue new packets.
 			sendQueueAvailable = s.sendQueue.Available()
+			// Cancel the pacing timer, as we can't send any more packets until the send queue is available again.
+			s.pacingDeadline = time.Time{}
 		} else {
 			sendQueueAvailable = nil
 		}
@@ -787,32 +811,45 @@ func (s *connection) handleHandshakeConfirmed(now time.Time) error {
 	return nil
 }
 
-func (s *connection) handlePackets(firstPacket receivedPacket) (wasProcessed bool, _ error) {
-	wasProcessed, err := s.handleOnePacket(firstPacket)
-	if err != nil {
-		return false, err
-	}
-	// only process a single packet at a time before handshake completion
-	if !s.handshakeComplete {
-		return wasProcessed, nil
-	}
+func (s *connection) handlePackets() (wasProcessed bool, _ error) {
 	// Now process all packets in the receivedPackets channel.
 	// Limit the number of packets to the length of the receivedPackets channel,
 	// so we eventually get a chance to send out an ACK when receiving a lot of packets.
-	numPackets := len(s.receivedPackets)
-receiveLoop:
+	s.receivedPacketMx.Lock()
+	numPackets := s.receivedPackets.Len()
+	if numPackets == 0 {
+		s.receivedPacketMx.Unlock()
+		return false, nil
+	}
+
+	var hasMorePackets bool
 	for i := 0; i < numPackets; i++ {
+		if i > 0 {
+			s.receivedPacketMx.Lock()
+		}
+		p := s.receivedPackets.PopFront()
+		hasMorePackets = !s.receivedPackets.Empty()
+		s.receivedPacketMx.Unlock()
+
+		processed, err := s.handleOnePacket(p)
+		if err != nil {
+			return false, err
+		}
+		if processed {
+			wasProcessed = true
+		}
+		if !hasMorePackets {
+			break
+		}
+		// only process a single packet at a time before handshake completion
+		if !s.handshakeComplete {
+			break
+		}
+	}
+	if hasMorePackets {
 		select {
-		case p := <-s.receivedPackets:
-			processed, err := s.handleOnePacket(p)
-			if err != nil {
-				return false, err
-			}
-			if processed {
-				wasProcessed = true
-			}
+		case s.notifyReceivedPacket <- struct{}{}:
 		default:
-			break receiveLoop
 		}
 	}
 	return wasProcessed, nil
@@ -1395,14 +1432,22 @@ func (s *connection) handleFrame(
 
 // handlePacket is called by the server with a new packet
 func (s *connection) handlePacket(p receivedPacket) {
+	s.receivedPacketMx.Lock()
 	// Discard packets once the amount of queued packets is larger than
 	// the channel size, protocol.MaxConnUnprocessedPackets
-	select {
-	case s.receivedPackets <- p:
-	default:
+	if s.receivedPackets.Len() >= protocol.MaxConnUnprocessedPackets {
 		if s.tracer != nil && s.tracer.DroppedPacket != nil {
 			s.tracer.DroppedPacket(logging.PacketTypeNotDetermined, protocol.InvalidPacketNumber, p.Size(), logging.PacketDropDOSPrevention)
 		}
+		s.receivedPacketMx.Unlock()
+		return
+	}
+	s.receivedPackets.PushBack(p)
+	s.receivedPacketMx.Unlock()
+
+	select {
+	case s.notifyReceivedPacket <- struct{}{}:
+	default:
 	}
 }
 
@@ -1587,6 +1632,13 @@ func (s *connection) handleAckFrame(frame *wire.AckFrame, encLevel protocol.Encr
 	if s.perspective == protocol.PerspectiveClient && !s.handshakeConfirmed {
 		if err := s.handleHandshakeConfirmed(rcvTime); err != nil {
 			return err
+		}
+	}
+	// If one of the acknowledged packets was a Path MTU probe packet, this might have increased the Path MTU estimate.
+	if s.mtuDiscoverer != nil {
+		if mtu := s.mtuDiscoverer.CurrentSize(); mtu > protocol.ByteCount(s.currentMTUEstimate.Load()) {
+			s.currentMTUEstimate.Store(uint32(mtu))
+			s.sentPacketHandler.SetMaxDatagramSize(mtu)
 		}
 	}
 	return s.cryptoStreamHandler.SetLargest1RTTAcked(frame.LargestAcked())
@@ -1854,7 +1906,6 @@ func (s *connection) applyTransportParameters() {
 		s.rttStats,
 		protocol.ByteCount(s.config.InitialPacketSize),
 		maxPacketSize,
-		s.onMTUIncreased,
 		s.tracer,
 	)
 }
@@ -1975,7 +2026,10 @@ func (s *connection) sendPacketsWithoutGSO(now time.Time) error {
 			return nil
 		}
 		// Prioritize receiving of packets over sending out more packets.
-		if len(s.receivedPackets) > 0 {
+		s.receivedPacketMx.Lock()
+		hasPackets := !s.receivedPackets.Empty()
+		s.receivedPacketMx.Unlock()
+		if hasPackets {
 			s.pacingDeadline = deadlineSendImmediately
 			return nil
 		}
@@ -2033,7 +2087,10 @@ func (s *connection) sendPacketsWithGSO(now time.Time) error {
 		}
 
 		// Prioritize receiving of packets over sending out more packets.
-		if len(s.receivedPackets) > 0 {
+		s.receivedPacketMx.Lock()
+		hasPackets := !s.receivedPackets.Empty()
+		s.receivedPacketMx.Unlock()
+		if hasPackets {
 			s.pacingDeadline = deadlineSendImmediately
 			return nil
 		}
@@ -2099,7 +2156,7 @@ func (s *connection) sendProbePacket(sendMode ackhandler.SendMode, now time.Time
 			break
 		}
 		var err error
-		packet, err = s.packer.MaybePackProbePacket(encLevel, s.maxPacketSize(), now, s.version)
+		packet, err = s.packer.MaybePackPTOProbePacket(encLevel, s.maxPacketSize(), now, s.version)
 		if err != nil {
 			return err
 		}
@@ -2110,7 +2167,7 @@ func (s *connection) sendProbePacket(sendMode ackhandler.SendMode, now time.Time
 	if packet == nil {
 		s.retransmissionQueue.AddPing(encLevel)
 		var err error
-		packet, err = s.packer.MaybePackProbePacket(encLevel, s.maxPacketSize(), now, s.version)
+		packet, err = s.packer.MaybePackPTOProbePacket(encLevel, s.maxPacketSize(), now, s.version)
 		if err != nil {
 			return err
 		}
@@ -2144,7 +2201,7 @@ func (s *connection) registerPackedShortHeaderPacket(p shortHeaderPacket, ecn pr
 	if p.Ack != nil {
 		largestAcked = p.Ack.LargestAcked()
 	}
-	s.sentPacketHandler.SentPacket(now, p.PacketNumber, largestAcked, p.StreamFrames, p.Frames, protocol.Encryption1RTT, ecn, p.Length, p.IsPathMTUProbePacket)
+	s.sentPacketHandler.SentPacket(now, p.PacketNumber, largestAcked, p.StreamFrames, p.Frames, protocol.Encryption1RTT, ecn, p.Length, p.IsPathMTUProbePacket, false)
 	s.connIDManager.SentPacket()
 }
 
@@ -2158,7 +2215,7 @@ func (s *connection) sendPackedCoalescedPacket(packet *coalescedPacket, ecn prot
 		if p.ack != nil {
 			largestAcked = p.ack.LargestAcked()
 		}
-		s.sentPacketHandler.SentPacket(now, p.header.PacketNumber, largestAcked, p.streamFrames, p.frames, p.EncryptionLevel(), ecn, p.length, false)
+		s.sentPacketHandler.SentPacket(now, p.header.PacketNumber, largestAcked, p.streamFrames, p.frames, p.EncryptionLevel(), ecn, p.length, false, false)
 		if s.perspective == protocol.PerspectiveClient && p.EncryptionLevel() == protocol.EncryptionHandshake &&
 			!s.droppedInitialKeys {
 			// On the client side, Initial keys are dropped as soon as the first Handshake packet is sent.
@@ -2176,7 +2233,7 @@ func (s *connection) sendPackedCoalescedPacket(packet *coalescedPacket, ecn prot
 		if p.Ack != nil {
 			largestAcked = p.Ack.LargestAcked()
 		}
-		s.sentPacketHandler.SentPacket(now, p.PacketNumber, largestAcked, p.StreamFrames, p.Frames, protocol.Encryption1RTT, ecn, p.Length, p.IsPathMTUProbePacket)
+		s.sentPacketHandler.SentPacket(now, p.PacketNumber, largestAcked, p.StreamFrames, p.Frames, protocol.Encryption1RTT, ecn, p.Length, p.IsPathMTUProbePacket, false)
 	}
 	s.connIDManager.SentPacket()
 	s.sendQueue.Send(packet.buffer, 0, ecn)
@@ -2322,11 +2379,6 @@ func (s *connection) onStreamCompleted(id protocol.StreamID) {
 	s.framer.RemoveActiveStream(id)
 }
 
-func (s *connection) onMTUIncreased(mtu protocol.ByteCount) {
-	s.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(mtu)))
-	s.sentPacketHandler.SetMaxDatagramSize(mtu)
-}
-
 func (s *connection) SendDatagram(p []byte) error {
 	if !s.supportsDatagrams() {
 		return errors.New("datagram support disabled")
@@ -2337,7 +2389,7 @@ func (s *connection) SendDatagram(p []byte) error {
 	// Under many circumstances we could send a few more bytes.
 	maxDataLen := min(
 		f.MaxDataLen(s.peerParams.MaxDatagramFrameSize, s.version),
-		protocol.ByteCount(s.maxPayloadSizeEstimate.Load()),
+		protocol.ByteCount(s.currentMTUEstimate.Load()),
 	)
 	if protocol.ByteCount(len(p)) > maxDataLen {
 		return &DatagramTooLargeError{MaxDatagramPayloadSize: int64(maxDataLen)}
