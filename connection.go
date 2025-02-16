@@ -129,6 +129,10 @@ type connection struct {
 	conn      sendConn
 	sendQueue sender
 
+	// lazily initialzed: most connections never migrate
+	pathManager        *pathManager
+	largestRcvdAppData protocol.PacketNumber
+
 	streamsMap      streamManager
 	connIDManager   *connIDManager
 	connIDGenerator *connIDGenerator
@@ -455,6 +459,7 @@ var newClientConnection = func(
 }
 
 func (s *connection) preSetup() {
+	s.largestRcvdAppData = protocol.InvalidPacketNumber
 	s.initialStream = newCryptoStream()
 	s.handshakeStream = newCryptoStream()
 	s.sendQueue = newSendQueue(s.conn)
@@ -971,6 +976,7 @@ func (s *connection) handleShortHeaderPacket(p receivedPacket) (wasProcessed boo
 		wasQueued, err = s.handleUnpackError(err, p, logging.PacketType1RTT)
 		return false, err
 	}
+	s.largestRcvdAppData = max(s.largestRcvdAppData, pn)
 
 	if s.logger.Debug() {
 		s.logger.Debugf("<- Reading packet %d (%d bytes) for connection %s, 1-RTT", pn, p.Size(), destConnID)
@@ -1001,8 +1007,53 @@ func (s *connection) handleShortHeaderPacket(p receivedPacket) (wasProcessed boo
 			)
 		}
 	}
-	if err := s.handleUnpackedShortHeaderPacket(destConnID, pn, data, p.ecn, p.rcvTime, log); err != nil {
+	isNonProbing, err := s.handleUnpackedShortHeaderPacket(destConnID, pn, data, p.ecn, p.rcvTime, log)
+	if err != nil {
 		return false, err
+	}
+
+	// In RFC 9000, only the client can migrate between paths.
+	if s.perspective == protocol.PerspectiveClient {
+		return true, nil
+	}
+
+	var shouldSwitchPath bool
+	if pn == s.largestRcvdAppData && !addrsEqual(p.remoteAddr, s.RemoteAddr()) {
+		if s.pathManager == nil {
+			s.pathManager = newPathManager(
+				s.connIDManager.GetConnIDForPath,
+				s.connIDManager.RetireConnIDForPath,
+				s.logger,
+			)
+		}
+		var destConnID protocol.ConnectionID
+		var pathChallenge ackhandler.Frame
+		destConnID, pathChallenge, shouldSwitchPath = s.pathManager.HandlePacket(p, isNonProbing)
+		if pathChallenge.Frame != nil {
+			probe, buf, err := s.packer.PackPathProbePacket(destConnID, pathChallenge, s.version)
+			if err != nil {
+				return false, err
+			}
+			s.logger.Debugf("sending path probe packet to %s", p.remoteAddr)
+			s.logShortHeaderPacket(probe.DestConnID, probe.Ack, probe.Frames, probe.StreamFrames, probe.PacketNumber, probe.PacketNumberLen, probe.KeyPhase, protocol.ECNNon, buf.Len(), false)
+			s.registerPackedShortHeaderPacket(probe, protocol.ECNNon, p.rcvTime)
+			s.sendQueue.SendProbe(buf, p.remoteAddr)
+		}
+	}
+
+	if shouldSwitchPath {
+		s.pathManager.SwitchToPath(p.remoteAddr)
+		s.sentPacketHandler.MigratedPath(p.rcvTime, protocol.ByteCount(s.config.InitialPacketSize))
+		maxPacketSize := protocol.ByteCount(protocol.MaxPacketBufferSize)
+		if s.peerParams.MaxUDPPayloadSize > 0 && s.peerParams.MaxUDPPayloadSize < maxPacketSize {
+			maxPacketSize = s.peerParams.MaxUDPPayloadSize
+		}
+		s.mtuDiscoverer.Reset(
+			p.rcvTime,
+			protocol.ByteCount(s.config.InitialPacketSize),
+			maxPacketSize,
+		)
+		s.conn.ChangeRemoteAddr(p.remoteAddr, p.info)
 	}
 	return true, nil
 }
@@ -1278,13 +1329,17 @@ func (s *connection) handleUnpackedLongHeaderPacket(
 	s.firstAckElicitingPacketAfterIdleSentTime = time.Time{}
 	s.keepAlivePingSent = false
 
+	if packet.hdr.Type == protocol.PacketType0RTT {
+		s.largestRcvdAppData = max(s.largestRcvdAppData, packet.hdr.PacketNumber)
+	}
+
 	var log func([]logging.Frame)
 	if s.tracer != nil && s.tracer.ReceivedLongHeaderPacket != nil {
 		log = func(frames []logging.Frame) {
 			s.tracer.ReceivedLongHeaderPacket(packet.hdr, packetSize, ecn, frames)
 		}
 	}
-	isAckEliciting, err := s.handleFrames(packet.data, packet.hdr.DestConnectionID, packet.encryptionLevel, log, rcvTime)
+	isAckEliciting, _, err := s.handleFrames(packet.data, packet.hdr.DestConnectionID, packet.encryptionLevel, log, rcvTime)
 	if err != nil {
 		return err
 	}
@@ -1298,16 +1353,19 @@ func (s *connection) handleUnpackedShortHeaderPacket(
 	ecn protocol.ECN,
 	rcvTime time.Time,
 	log func([]logging.Frame),
-) error {
+) (isNonProbing bool, _ error) {
 	s.lastPacketReceivedTime = rcvTime
 	s.firstAckElicitingPacketAfterIdleSentTime = time.Time{}
 	s.keepAlivePingSent = false
 
-	isAckEliciting, err := s.handleFrames(data, destConnID, protocol.Encryption1RTT, log, rcvTime)
+	isAckEliciting, isNonProbing, err := s.handleFrames(data, destConnID, protocol.Encryption1RTT, log, rcvTime)
 	if err != nil {
-		return err
+		return false, err
 	}
-	return s.receivedPacketHandler.ReceivedPacket(pn, ecn, protocol.Encryption1RTT, rcvTime, isAckEliciting)
+	if err := s.receivedPacketHandler.ReceivedPacket(pn, ecn, protocol.Encryption1RTT, rcvTime, isAckEliciting); err != nil {
+		return false, err
+	}
+	return isNonProbing, nil
 }
 
 func (s *connection) handleFrames(
@@ -1316,7 +1374,7 @@ func (s *connection) handleFrames(
 	encLevel protocol.EncryptionLevel,
 	log func([]logging.Frame),
 	rcvTime time.Time,
-) (isAckEliciting bool, _ error) {
+) (isAckEliciting, isNonProbing bool, _ error) {
 	// Only used for tracing.
 	// If we're not tracing, this slice will always remain empty.
 	var frames []logging.Frame
@@ -1328,7 +1386,7 @@ func (s *connection) handleFrames(
 	for len(data) > 0 {
 		l, frame, err := s.frameParser.ParseNext(data, encLevel, s.version)
 		if err != nil {
-			return false, err
+			return false, false, err
 		}
 		data = data[l:]
 		if frame == nil {
@@ -1336,6 +1394,9 @@ func (s *connection) handleFrames(
 		}
 		if ackhandler.IsFrameAckEliciting(frame) {
 			isAckEliciting = true
+		}
+		if !wire.IsProbingFrame(frame) {
+			isNonProbing = true
 		}
 		if log != nil {
 			frames = append(frames, toLoggingFrame(frame))
@@ -1347,7 +1408,7 @@ func (s *connection) handleFrames(
 		}
 		if err := s.handleFrame(frame, encLevel, destConnID, rcvTime); err != nil {
 			if log == nil {
-				return false, err
+				return false, false, err
 			}
 			// If we're logging, we need to keep parsing (but not handling) all frames.
 			handleErr = err
@@ -1357,7 +1418,7 @@ func (s *connection) handleFrames(
 	if log != nil {
 		log(frames)
 		if handleErr != nil {
-			return false, handleErr
+			return false, false, handleErr
 		}
 	}
 
@@ -1367,10 +1428,9 @@ func (s *connection) handleFrames(
 	// and an ACK serialized after that CRYPTO frame. In this case, we still want to process the ACK frame.
 	if !handshakeWasComplete && s.handshakeComplete {
 		if err := s.handleHandshakeComplete(rcvTime); err != nil {
-			return false, err
+			return false, false, err
 		}
 	}
-
 	return
 }
 
@@ -1409,11 +1469,7 @@ func (s *connection) handleFrame(
 	case *wire.PathChallengeFrame:
 		s.handlePathChallengeFrame(frame)
 	case *wire.PathResponseFrame:
-		// since we don't send PATH_CHALLENGEs, we don't expect PATH_RESPONSEs
-		err = &qerr.TransportError{
-			ErrorCode:    qerr.ProtocolViolation,
-			ErrorMessage: "unexpected PATH_RESPONSE frame",
-		}
+		err = s.handlePathResponseFrame(frame)
 	case *wire.NewTokenFrame:
 		err = s.handleNewTokenFrame(frame)
 	case *wire.NewConnectionIDFrame:
@@ -1500,8 +1556,8 @@ func (s *connection) handleHandshakeEvents(now time.Time) error {
 			s.restoreTransportParameters(ev.TransportParameters)
 			close(s.earlyConnReadyChan)
 		case handshake.EventReceivedReadKeys:
-			// Queue all packets for decryption that have been undecryptable so far.
-			s.undecryptablePacketsToProcess = s.undecryptablePackets
+			// queue all previously undecryptable packets
+			s.undecryptablePacketsToProcess = append(s.undecryptablePacketsToProcess, s.undecryptablePackets...)
 			s.undecryptablePackets = nil
 		case handshake.EventDiscard0RTTKeys:
 			err = s.dropEncryptionLevel(protocol.Encryption0RTT, now)
@@ -1580,8 +1636,21 @@ func (s *connection) handleStopSendingFrame(frame *wire.StopSendingFrame) error 
 	return nil
 }
 
-func (s *connection) handlePathChallengeFrame(frame *wire.PathChallengeFrame) {
-	s.queueControlFrame(&wire.PathResponseFrame{Data: frame.Data})
+func (s *connection) handlePathChallengeFrame(f *wire.PathChallengeFrame) {
+	s.queueControlFrame(&wire.PathResponseFrame{Data: f.Data})
+}
+
+func (s *connection) handlePathResponseFrame(f *wire.PathResponseFrame) error {
+	s.logger.Debugf("received PATH_RESPONSE frame: %v", f.Data)
+	if s.pathManager == nil {
+		// since we didn't send PATH_CHALLENGEs yet, we don't expect PATH_RESPONSEs
+		return &qerr.TransportError{
+			ErrorCode:    qerr.ProtocolViolation,
+			ErrorMessage: "unexpected PATH_RESPONSE frame",
+		}
+	}
+	s.pathManager.HandlePathResponseFrame(f)
+	return nil
 }
 
 func (s *connection) handleNewTokenFrame(frame *wire.NewTokenFrame) error {
@@ -2193,6 +2262,21 @@ func (s *connection) appendOneShortHeaderPacket(buf *packetBuffer, maxSize proto
 }
 
 func (s *connection) registerPackedShortHeaderPacket(p shortHeaderPacket, ecn protocol.ECN, now time.Time) {
+	if p.IsPathProbePacket {
+		s.sentPacketHandler.SentPacket(
+			now,
+			p.PacketNumber,
+			protocol.InvalidPacketNumber,
+			p.StreamFrames,
+			p.Frames,
+			protocol.Encryption1RTT,
+			ecn,
+			p.Length,
+			p.IsPathMTUProbePacket,
+			true,
+		)
+		return
+	}
 	if s.firstAckElicitingPacketAfterIdleSentTime.IsZero() && (len(p.StreamFrames) > 0 || ackhandler.HasAckElicitingFrames(p.Frames)) {
 		s.firstAckElicitingPacketAfterIdleSentTime = now
 	}
@@ -2201,7 +2285,18 @@ func (s *connection) registerPackedShortHeaderPacket(p shortHeaderPacket, ecn pr
 	if p.Ack != nil {
 		largestAcked = p.Ack.LargestAcked()
 	}
-	s.sentPacketHandler.SentPacket(now, p.PacketNumber, largestAcked, p.StreamFrames, p.Frames, protocol.Encryption1RTT, ecn, p.Length, p.IsPathMTUProbePacket, false)
+	s.sentPacketHandler.SentPacket(
+		now,
+		p.PacketNumber,
+		largestAcked,
+		p.StreamFrames,
+		p.Frames,
+		protocol.Encryption1RTT,
+		ecn,
+		p.Length,
+		p.IsPathMTUProbePacket,
+		false,
+	)
 	s.connIDManager.SentPacket()
 }
 
@@ -2215,7 +2310,18 @@ func (s *connection) sendPackedCoalescedPacket(packet *coalescedPacket, ecn prot
 		if p.ack != nil {
 			largestAcked = p.ack.LargestAcked()
 		}
-		s.sentPacketHandler.SentPacket(now, p.header.PacketNumber, largestAcked, p.streamFrames, p.frames, p.EncryptionLevel(), ecn, p.length, false, false)
+		s.sentPacketHandler.SentPacket(
+			now,
+			p.header.PacketNumber,
+			largestAcked,
+			p.streamFrames,
+			p.frames,
+			p.EncryptionLevel(),
+			ecn,
+			p.length,
+			false,
+			false,
+		)
 		if s.perspective == protocol.PerspectiveClient && p.EncryptionLevel() == protocol.EncryptionHandshake &&
 			!s.droppedInitialKeys {
 			// On the client side, Initial keys are dropped as soon as the first Handshake packet is sent.
@@ -2233,7 +2339,18 @@ func (s *connection) sendPackedCoalescedPacket(packet *coalescedPacket, ecn prot
 		if p.Ack != nil {
 			largestAcked = p.Ack.LargestAcked()
 		}
-		s.sentPacketHandler.SentPacket(now, p.PacketNumber, largestAcked, p.StreamFrames, p.Frames, protocol.Encryption1RTT, ecn, p.Length, p.IsPathMTUProbePacket, false)
+		s.sentPacketHandler.SentPacket(
+			now,
+			p.PacketNumber,
+			largestAcked,
+			p.StreamFrames,
+			p.Frames,
+			protocol.Encryption1RTT,
+			ecn,
+			p.Length,
+			p.IsPathMTUProbePacket,
+			false,
+		)
 	}
 	s.connIDManager.SentPacket()
 	s.sendQueue.Send(packet.buffer, 0, ecn)
