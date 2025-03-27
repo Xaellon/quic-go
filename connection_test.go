@@ -81,7 +81,7 @@ func connectionOptRetrySrcConnID(rcid protocol.ConnectionID) testConnectionOpt {
 
 type testConnection struct {
 	conn       *connection
-	connRunner *MockConnRunner
+	connRunner *MockPacketHandlerManager
 	sendConn   *MockSendConn
 	packer     *MockPacker
 	destConnID protocol.ConnectionID
@@ -101,7 +101,7 @@ func newServerTestConnection(
 	}
 	remoteAddr := &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 4321}
 	localAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234}
-	connRunner := NewMockConnRunner(mockCtrl)
+	phm := NewMockPacketHandlerManager(mockCtrl)
 	sendConn := NewMockSendConn(mockCtrl)
 	sendConn.EXPECT().capabilities().Return(connCapabilities{GSO: gso}).AnyTimes()
 	sendConn.EXPECT().RemoteAddr().Return(remoteAddr).AnyTimes()
@@ -119,7 +119,7 @@ func newServerTestConnection(
 		ctx,
 		cancel,
 		sendConn,
-		connRunner,
+		&Transport{handlerMap: phm},
 		origDestConnID,
 		nil,
 		protocol.ConnectionID{},
@@ -141,7 +141,7 @@ func newServerTestConnection(
 	}
 	return &testConnection{
 		conn:       conn,
-		connRunner: connRunner,
+		connRunner: phm,
 		sendConn:   sendConn,
 		packer:     packer,
 		destConnID: origDestConnID,
@@ -162,7 +162,7 @@ func newClientTestConnection(
 	}
 	remoteAddr := &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 4321}
 	localAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234}
-	connRunner := NewMockConnRunner(mockCtrl)
+	phm := NewMockPacketHandlerManager(mockCtrl)
 	sendConn := NewMockSendConn(mockCtrl)
 	sendConn.EXPECT().capabilities().Return(connCapabilities{}).AnyTimes()
 	sendConn.EXPECT().RemoteAddr().Return(remoteAddr).AnyTimes()
@@ -178,7 +178,7 @@ func newClientTestConnection(
 	conn := newClientConnection(
 		context.Background(),
 		sendConn,
-		connRunner,
+		&Transport{handlerMap: phm},
 		destConnID,
 		srcConnID,
 		&protocol.DefaultConnectionIDGenerator{},
@@ -198,7 +198,7 @@ func newClientTestConnection(
 	}
 	return &testConnection{
 		conn:       conn,
-		connRunner: connRunner,
+		connRunner: phm,
 		sendConn:   sendConn,
 		packer:     packer,
 		destConnID: destConnID,
@@ -222,14 +222,17 @@ func TestConnectionHandleReceiveStreamFrames(t *testing.T) {
 		// STREAM frame
 		streamsMap.EXPECT().GetOrOpenReceiveStream(streamID).Return(str, nil)
 		str.EXPECT().handleStreamFrame(f, now)
-		require.NoError(t, tc.conn.handleFrame(f, protocol.Encryption1RTT, connID, now))
+		_, err := tc.conn.handleFrame(f, protocol.Encryption1RTT, connID, now)
+		require.NoError(t, err)
 		// RESET_STREAM frame
 		streamsMap.EXPECT().GetOrOpenReceiveStream(streamID).Return(str, nil)
 		str.EXPECT().handleResetStreamFrame(rsf, now)
-		require.NoError(t, tc.conn.handleFrame(rsf, protocol.Encryption1RTT, connID, now))
+		_, err = tc.conn.handleFrame(rsf, protocol.Encryption1RTT, connID, now)
+		require.NoError(t, err)
 		// STREAM_DATA_BLOCKED frames are not passed to the stream
 		streamsMap.EXPECT().GetOrOpenReceiveStream(streamID).Return(str, nil)
-		require.NoError(t, tc.conn.handleFrame(sdbf, protocol.Encryption1RTT, connID, now))
+		_, err = tc.conn.handleFrame(sdbf, protocol.Encryption1RTT, connID, now)
+		require.NoError(t, err)
 	})
 
 	t.Run("for closed streams", func(t *testing.T) {
@@ -238,13 +241,16 @@ func TestConnectionHandleReceiveStreamFrames(t *testing.T) {
 		tc := newServerTestConnection(t, mockCtrl, nil, false, connectionOptStreamManager(streamsMap))
 		// STREAM frame
 		streamsMap.EXPECT().GetOrOpenReceiveStream(streamID).Return(nil, nil)
-		require.NoError(t, tc.conn.handleFrame(f, protocol.Encryption1RTT, connID, now))
+		_, err := tc.conn.handleFrame(f, protocol.Encryption1RTT, connID, now)
+		require.NoError(t, err)
 		// RESET_STREAM frame
 		streamsMap.EXPECT().GetOrOpenReceiveStream(streamID).Return(nil, nil)
-		require.NoError(t, tc.conn.handleFrame(rsf, protocol.Encryption1RTT, connID, now))
+		_, err = tc.conn.handleFrame(rsf, protocol.Encryption1RTT, connID, now)
+		require.NoError(t, err)
 		// STREAM_DATA_BLOCKED frames are not passed to the stream
 		streamsMap.EXPECT().GetOrOpenReceiveStream(streamID).Return(nil, nil)
-		require.NoError(t, tc.conn.handleFrame(sdbf, protocol.Encryption1RTT, connID, now))
+		_, err = tc.conn.handleFrame(sdbf, protocol.Encryption1RTT, connID, now)
+		require.NoError(t, err)
 	})
 
 	t.Run("for invalid streams", func(t *testing.T) {
@@ -254,13 +260,16 @@ func TestConnectionHandleReceiveStreamFrames(t *testing.T) {
 		testErr := errors.New("test err")
 		// STREAM frame
 		streamsMap.EXPECT().GetOrOpenReceiveStream(streamID).Return(nil, testErr)
-		require.ErrorIs(t, tc.conn.handleFrame(f, protocol.Encryption1RTT, connID, now), testErr)
+		_, err := tc.conn.handleFrame(f, protocol.Encryption1RTT, connID, now)
+		require.ErrorIs(t, err, testErr)
 		// RESET_STREAM frame
 		streamsMap.EXPECT().GetOrOpenReceiveStream(streamID).Return(nil, testErr)
-		require.ErrorIs(t, tc.conn.handleFrame(rsf, protocol.Encryption1RTT, connID, now), testErr)
+		_, err = tc.conn.handleFrame(rsf, protocol.Encryption1RTT, connID, now)
+		require.ErrorIs(t, err, testErr)
 		// STREAM_DATA_BLOCKED frames are not passed to the stream
 		streamsMap.EXPECT().GetOrOpenReceiveStream(streamID).Return(nil, testErr)
-		require.ErrorIs(t, tc.conn.handleFrame(sdbf, protocol.Encryption1RTT, connID, now), testErr)
+		_, err = tc.conn.handleFrame(sdbf, protocol.Encryption1RTT, connID, now)
+		require.ErrorIs(t, err, testErr)
 	})
 }
 
@@ -279,11 +288,13 @@ func TestConnectionHandleSendStreamFrames(t *testing.T) {
 		// STOP_SENDING frame
 		streamsMap.EXPECT().GetOrOpenSendStream(streamID).Return(str, nil)
 		str.EXPECT().handleStopSendingFrame(ss)
-		require.NoError(t, tc.conn.handleFrame(ss, protocol.Encryption1RTT, connID, now))
+		_, err := tc.conn.handleFrame(ss, protocol.Encryption1RTT, connID, now)
+		require.NoError(t, err)
 		// MAX_STREAM_DATA frame
 		streamsMap.EXPECT().GetOrOpenSendStream(streamID).Return(str, nil)
 		str.EXPECT().updateSendWindow(msd.MaximumStreamData)
-		require.NoError(t, tc.conn.handleFrame(msd, protocol.Encryption1RTT, connID, now))
+		_, err = tc.conn.handleFrame(msd, protocol.Encryption1RTT, connID, now)
+		require.NoError(t, err)
 	})
 
 	t.Run("for closed streams", func(t *testing.T) {
@@ -292,10 +303,12 @@ func TestConnectionHandleSendStreamFrames(t *testing.T) {
 		tc := newServerTestConnection(t, mockCtrl, nil, false, connectionOptStreamManager(streamsMap))
 		// STOP_SENDING frame
 		streamsMap.EXPECT().GetOrOpenSendStream(streamID).Return(nil, nil)
-		require.NoError(t, tc.conn.handleFrame(ss, protocol.Encryption1RTT, connID, now))
+		_, err := tc.conn.handleFrame(ss, protocol.Encryption1RTT, connID, now)
+		require.NoError(t, err)
 		// MAX_STREAM_DATA frame
 		streamsMap.EXPECT().GetOrOpenSendStream(streamID).Return(nil, nil)
-		require.NoError(t, tc.conn.handleFrame(msd, protocol.Encryption1RTT, connID, now))
+		_, err = tc.conn.handleFrame(msd, protocol.Encryption1RTT, connID, now)
+		require.NoError(t, err)
 	})
 
 	t.Run("for invalid streams", func(t *testing.T) {
@@ -305,10 +318,12 @@ func TestConnectionHandleSendStreamFrames(t *testing.T) {
 		testErr := errors.New("test err")
 		// STOP_SENDING frame
 		streamsMap.EXPECT().GetOrOpenSendStream(streamID).Return(nil, testErr)
-		require.ErrorIs(t, tc.conn.handleFrame(ss, protocol.Encryption1RTT, connID, now), testErr)
+		_, err := tc.conn.handleFrame(ss, protocol.Encryption1RTT, connID, now)
+		require.ErrorIs(t, err, testErr)
 		// MAX_STREAM_DATA frame
 		streamsMap.EXPECT().GetOrOpenSendStream(streamID).Return(nil, testErr)
-		require.ErrorIs(t, tc.conn.handleFrame(msd, protocol.Encryption1RTT, connID, now), testErr)
+		_, err = tc.conn.handleFrame(msd, protocol.Encryption1RTT, connID, now)
+		require.ErrorIs(t, err, testErr)
 	})
 }
 
@@ -321,9 +336,11 @@ func TestConnectionHandleStreamNumFrames(t *testing.T) {
 	// MAX_STREAMS frame
 	msf := &wire.MaxStreamsFrame{Type: protocol.StreamTypeBidi, MaxStreamNum: 10}
 	streamsMap.EXPECT().HandleMaxStreamsFrame(msf)
-	require.NoError(t, tc.conn.handleFrame(msf, protocol.Encryption1RTT, connID, now))
+	_, err := tc.conn.handleFrame(msf, protocol.Encryption1RTT, connID, now)
+	require.NoError(t, err)
 	// STREAMS_BLOCKED frame
-	tc.conn.handleFrame(&wire.StreamsBlockedFrame{Type: protocol.StreamTypeBidi, StreamLimit: 1}, protocol.Encryption1RTT, connID, now)
+	_, err = tc.conn.handleFrame(&wire.StreamsBlockedFrame{Type: protocol.StreamTypeBidi, StreamLimit: 1}, protocol.Encryption1RTT, connID, now)
+	require.NoError(t, err)
 }
 
 func TestConnectionHandleConnectionFlowControlFrames(t *testing.T) {
@@ -334,9 +351,11 @@ func TestConnectionHandleConnectionFlowControlFrames(t *testing.T) {
 	connID := protocol.ConnectionID{}
 	// MAX_DATA frame
 	connFC.EXPECT().UpdateSendWindow(protocol.ByteCount(1337))
-	require.NoError(t, tc.conn.handleFrame(&wire.MaxDataFrame{MaximumData: 1337}, protocol.Encryption1RTT, connID, now))
+	_, err := tc.conn.handleFrame(&wire.MaxDataFrame{MaximumData: 1337}, protocol.Encryption1RTT, connID, now)
+	require.NoError(t, err)
 	// DATA_BLOCKED frame
-	require.NoError(t, tc.conn.handleFrame(&wire.DataBlockedFrame{MaximumData: 1337}, protocol.Encryption1RTT, connID, now))
+	_, err = tc.conn.handleFrame(&wire.DataBlockedFrame{MaximumData: 1337}, protocol.Encryption1RTT, connID, now)
+	require.NoError(t, err)
 }
 
 func TestConnectionOpenStreams(t *testing.T) {
@@ -404,10 +423,8 @@ func TestConnectionServerInvalidFrames(t *testing.T) {
 		{Name: "PATH_RESPONSE", Frame: &wire.PathResponseFrame{Data: [8]byte{1, 2, 3, 4, 5, 6, 7, 8}}},
 	} {
 		t.Run(test.Name, func(t *testing.T) {
-			require.ErrorIs(t,
-				tc.conn.handleFrame(test.Frame, protocol.Encryption1RTT, protocol.ConnectionID{}, time.Now()),
-				&qerr.TransportError{ErrorCode: qerr.ProtocolViolation},
-			)
+			_, err := tc.conn.handleFrame(test.Frame, protocol.Encryption1RTT, protocol.ConnectionID{}, time.Now())
+			require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.ProtocolViolation})
 		})
 	}
 }
@@ -2714,11 +2731,11 @@ func testConnectionConnectionIDChanges(t *testing.T, sendRetry bool) {
 	newConnID := protocol.ParseConnectionID(b[:11])
 	newConnID2 := protocol.ParseConnectionID(b[11:20])
 
-	errChan := make(chan error, 1)
-	go func() { errChan <- tc.conn.run() }()
-
 	tracer.EXPECT().NegotiatedVersion(gomock.Any(), gomock.Any(), gomock.Any())
 	tc.packer.EXPECT().PackCoalescedPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+
+	errChan := make(chan error, 1)
+	go func() { errChan <- tc.conn.run() }()
 
 	require.Equal(t, dstConnID, tc.conn.connIDManager.Get())
 
@@ -2887,8 +2904,8 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 			protocol.PacketNumber(10), protocol.PacketNumberLen2, protocol.KeyPhaseZero, payload, nil,
 		),
 		tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-			func(_ protocol.ConnectionID, f ackhandler.Frame, _ protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
-				pathChallenge = f.Frame.(*wire.PathChallengeFrame)
+			func(_ protocol.ConnectionID, frames []ackhandler.Frame, _ protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
+				pathChallenge = frames[0].Frame.(*wire.PathChallengeFrame)
 				return shortHeaderPacket{IsPathProbePacket: true}, getPacketBuffer(), nil
 			},
 		),
@@ -2960,6 +2977,8 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 		}
 
 		payload := []byte{1} // PING frame
+		payload, err = (&wire.PathResponseFrame{Data: pathChallenge.Data}).Append(payload, protocol.Version1)
+		require.NoError(t, err)
 		gomock.InOrder(
 			unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).Return(
 				protocol.PacketNumber(12), protocol.PacketNumberLen2, protocol.KeyPhaseZero, payload, nil,
@@ -2986,6 +3005,89 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 	}
 
 	// test teardown
+	tc.connRunner.EXPECT().Remove(gomock.Any()).AnyTimes()
+	tc.conn.destroy(nil)
+	select {
+	case <-errChan:
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+}
+
+func TestConnectionMigrationServer(t *testing.T) {
+	tc := newServerTestConnection(t, nil, nil, false)
+	_, err := tc.conn.AddPath(&Transport{})
+	require.Error(t, err)
+	require.ErrorContains(t, err, "server cannot initiate connection migration")
+}
+
+func TestConnectionMigration(t *testing.T) {
+	t.Run("disabled", func(t *testing.T) {
+		testConnectionMigration(t, false)
+	})
+
+	t.Run("enabled", func(t *testing.T) {
+		testConnectionMigration(t, true)
+	})
+}
+
+func testConnectionMigration(t *testing.T, enabled bool) {
+	tc := newClientTestConnection(t, nil, nil, false, connectionOptHandshakeConfirmed())
+	require.NoError(t, tc.conn.handleTransportParameters(&wire.TransportParameters{
+		InitialSourceConnectionID:       tc.destConnID,
+		OriginalDestinationConnectionID: tc.destConnID,
+		DisableActiveMigration:          !enabled,
+	}))
+
+	tr := &Transport{
+		Conn:              newUDPConnLocalhost(t),
+		StatelessResetKey: &StatelessResetKey{},
+	}
+	defer tr.Close()
+	path, err := tc.conn.AddPath(tr)
+	if !enabled {
+		require.Error(t, err)
+		require.ErrorContains(t, err, "server disabled connection migration")
+		return
+	}
+	require.NoError(t, err)
+	require.NotNil(t, path)
+
+	tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
+		shortHeaderPacket{}, errNothingToPack,
+	).AnyTimes()
+	packedProbe := make(chan struct{})
+	tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(protocol.ConnectionID, []ackhandler.Frame, protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
+			defer close(packedProbe)
+			return shortHeaderPacket{IsPathProbePacket: true}, getPacketBuffer(), nil
+		},
+	).AnyTimes()
+	// add a new connection ID, so the path can be probed
+	require.NoError(t, tc.conn.handleNewConnectionIDFrame(&wire.NewConnectionIDFrame{
+		SequenceNumber: 1,
+		ConnectionID:   protocol.ParseConnectionID([]byte{1, 2, 3, 4}),
+	}))
+	errChan := make(chan error, 1)
+	go func() { errChan <- tc.conn.run() }()
+
+	// Adding the path initialized the transport.
+	// We can test this by triggering a stateless reset.
+	conn := newUDPConnLocalhost(t)
+	_, err = conn.WriteTo(append([]byte{0x40}, make([]byte, 100)...), tr.Conn.LocalAddr())
+	require.NoError(t, err)
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	_, _, err = conn.ReadFrom(make([]byte, 100))
+	require.NoError(t, err)
+
+	go func() { path.Probe(context.Background()) }()
+	select {
+	case <-packedProbe:
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+
+	// teardown
 	tc.connRunner.EXPECT().Remove(gomock.Any()).AnyTimes()
 	tc.conn.destroy(nil)
 	select {
