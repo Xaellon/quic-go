@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	mrand "math/rand"
+	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -26,6 +26,7 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	quicproxy "github.com/quic-go/quic-go/integrationtests/tools/proxy"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -42,7 +43,7 @@ func randomString(length int) string {
 	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, length)
 	for i := range b {
-		n := mrand.Intn(len(alphabet))
+		n := mrand.IntN(len(alphabet))
 		b[i] = alphabet[n]
 	}
 	return string(b)
@@ -396,14 +397,13 @@ func TestHTTPReestablishConnectionAfterDialError(t *testing.T) {
 	port := startHTTPServer(t, mux)
 
 	var dialCounter int
-	testErr := errors.New("test error")
 	cl := http.Client{
 		Transport: &http3.Transport{
 			TLSClientConfig: getTLSClientConfig(),
 			Dial: func(ctx context.Context, addr string, tlsConf *tls.Config, conf *quic.Config) (quic.EarlyConnection, error) {
 				dialCounter++
 				if dialCounter == 1 { // make the first dial fail
-					return nil, testErr
+					return nil, assert.AnError
 				}
 				return quic.DialAddrEarly(ctx, addr, tlsConf, conf)
 			},
@@ -412,7 +412,7 @@ func TestHTTPReestablishConnectionAfterDialError(t *testing.T) {
 	defer cl.Transport.(io.Closer).Close()
 
 	_, err := cl.Get(fmt.Sprintf("https://localhost:%d/hello", port))
-	require.ErrorIs(t, err, testErr)
+	require.ErrorIs(t, err, assert.AnError)
 	resp, err := cl.Get(fmt.Sprintf("https://localhost:%d/hello", port))
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)

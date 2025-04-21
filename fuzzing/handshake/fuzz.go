@@ -2,8 +2,8 @@ package handshake
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -11,7 +11,7 @@ import (
 	"io"
 	"log"
 	"math"
-	mrand "math/rand"
+	mrand "math/rand/v2"
 	"net"
 	"time"
 
@@ -30,7 +30,7 @@ var (
 )
 
 func init() {
-	priv, err := rsa.GenerateKey(rand.Reader, 1024)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func init() {
 		log.Fatal(err)
 	}
 
-	privClient, err := rsa.GenerateKey(rand.Reader, 1024)
+	_, privClient, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -120,13 +120,13 @@ func toEncryptionLevel(n uint8) protocol.EncryptionLevel {
 
 func getTransportParameters(seed uint8) *wire.TransportParameters {
 	const maxVarInt = math.MaxUint64 / 4
-	r := mrand.New(mrand.NewSource(int64(seed)))
+	r := mrand.New(mrand.NewPCG(uint64(seed), uint64(seed)))
 	return &wire.TransportParameters{
 		ActiveConnectionIDLimit:        2,
-		InitialMaxData:                 protocol.ByteCount(r.Int63n(maxVarInt)),
-		InitialMaxStreamDataBidiLocal:  protocol.ByteCount(r.Int63n(maxVarInt)),
-		InitialMaxStreamDataBidiRemote: protocol.ByteCount(r.Int63n(maxVarInt)),
-		InitialMaxStreamDataUni:        protocol.ByteCount(r.Int63n(maxVarInt)),
+		InitialMaxData:                 protocol.ByteCount(r.IntN(maxVarInt)),
+		InitialMaxStreamDataBidiLocal:  protocol.ByteCount(r.IntN(maxVarInt)),
+		InitialMaxStreamDataBidiRemote: protocol.ByteCount(r.IntN(maxVarInt)),
+		InitialMaxStreamDataUni:        protocol.ByteCount(r.IntN(maxVarInt)),
 	}
 }
 

@@ -672,10 +672,17 @@ func testServerCreateConnection(t *testing.T, useRetry bool) {
 		tokenGeneratorKey: tokenGeneratorKey,
 	})
 
+	done := make(chan struct{}, 3)
 	c := NewMockQUICConn(mockCtrl)
-	c.EXPECT().run()
-	c.EXPECT().Context().Return(context.Background())
-	c.EXPECT().HandshakeComplete().Return(make(chan struct{}))
+	c.EXPECT().run().Do(func() error { done <- struct{}{}; return nil })
+	c.EXPECT().Context().DoAndReturn(func() context.Context {
+		done <- struct{}{}
+		return context.Background()
+	})
+	c.EXPECT().HandshakeComplete().DoAndReturn(func() <-chan struct{} {
+		done <- struct{}{}
+		return make(chan struct{})
+	})
 	recorder := newConnConstructorRecorder(c)
 	server.newConn = recorder.NewConn
 
@@ -723,6 +730,14 @@ func testServerCreateConnection(t *testing.T, useRetry bool) {
 	} else {
 		assert.Equal(t, protocol.ParseConnectionID([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}), args.origDestConnID)
 		assert.Zero(t, args.retrySrcConnID)
+	}
+
+	for range 3 {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("timeout")
+		}
 	}
 
 	// shutdown
@@ -792,7 +807,7 @@ func TestServerGetConfigForClientAccept(t *testing.T) {
 	recorder := newConnConstructorRecorder(c)
 	server := newTestServer(t, &serverOpts{
 		config: &Config{
-			GetConfigForClient: func(*ClientHelloInfo) (*Config, error) {
+			GetConfigForClient: func(*ClientInfo) (*Config, error) {
 				return &Config{MaxIncomingStreams: 1234}, nil
 			},
 		},
@@ -831,7 +846,7 @@ func TestServerGetConfigForClientReject(t *testing.T) {
 	server := newTestServer(t, &serverOpts{
 		tracer: tracer,
 		config: &Config{
-			GetConfigForClient: func(*ClientHelloInfo) (*Config, error) {
+			GetConfigForClient: func(*ClientInfo) (*Config, error) {
 				return nil, errors.New("rejected")
 			},
 		},
@@ -1165,12 +1180,13 @@ func TestServer0RTTReordering(t *testing.T) {
 	server.handlePacket(p)
 
 	// now receive the Initial
+	done := make(chan struct{})
 	initial := getValidInitialPacket(t, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 42}, randConnID(5), connID)
 	packets := make(chan receivedPacket, protocol.Max0RTTQueueLen+1)
 	conn.EXPECT().handlePacket(gomock.Any()).Do(func(p receivedPacket) { packets <- p }).AnyTimes()
 	conn.EXPECT().Context().Return(context.Background())
 	conn.EXPECT().earlyConnReady().Return(make(chan struct{}))
-	conn.EXPECT().run()
+	conn.EXPECT().run().Do(func() error { close(done); return nil })
 	server.handlePacket(initial)
 
 	for i := range protocol.Max0RTTQueueLen + 1 {
@@ -1184,6 +1200,12 @@ func TestServer0RTTReordering(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("timeout")
 		}
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
 	}
 
 	// shutdown

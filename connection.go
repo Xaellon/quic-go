@@ -600,7 +600,7 @@ runLoop:
 		// We don't need to wait for new events if:
 		// * we processed packets: we probably need to send an ACK, and potentially more data
 		// * the pacer allows us to send more packets immediately
-		shouldProceedImmediately := sendQueueAvailable == nil && (processed || s.pacingDeadline == deadlineSendImmediately)
+		shouldProceedImmediately := sendQueueAvailable == nil && (processed || s.pacingDeadline.Equal(deadlineSendImmediately))
 		if !shouldProceedImmediately {
 			// 3rd: wait for something to happen:
 			// * closing of the connection
@@ -980,7 +980,7 @@ func (s *connection) handleOnePacket(rp receivedPacket) (wasProcessed bool, _ er
 			if counter > 0 {
 				p.buffer.Split()
 			}
-			processed, err := s.handleShortHeaderPacket(p)
+			processed, err := s.handleShortHeaderPacket(p, counter > 0)
 			if err != nil {
 				return false, err
 			}
@@ -995,7 +995,7 @@ func (s *connection) handleOnePacket(rp receivedPacket) (wasProcessed bool, _ er
 	return wasProcessed, nil
 }
 
-func (s *connection) handleShortHeaderPacket(p receivedPacket) (wasProcessed bool, _ error) {
+func (s *connection) handleShortHeaderPacket(p receivedPacket, isCoalesced bool) (wasProcessed bool, _ error) {
 	var wasQueued bool
 
 	defer func() {
@@ -1012,6 +1012,17 @@ func (s *connection) handleShortHeaderPacket(p receivedPacket) (wasProcessed boo
 	}
 	pn, pnLen, keyPhase, data, err := s.unpacker.UnpackShortHeader(p.rcvTime, p.data)
 	if err != nil {
+		// Stateless reset packets (see RFC 9000, section 10.3):
+		// * fill the entire UDP datagram (i.e. they cannot be part of a coalesced packet)
+		// * are short header packets (first bit is 0)
+		// * have the QUIC bit set (second bit is 1)
+		// * are at least 21 bytes long
+		if !isCoalesced && len(p.data) >= protocol.MinReceivedStatelessResetSize && p.data[0]&0b11000000 == 0b01000000 {
+			token := protocol.StatelessResetToken(p.data[len(p.data)-16:])
+			if s.connIDManager.IsActiveStatelessResetToken(token) {
+				return false, &StatelessResetError{}
+			}
+		}
 		wasQueued, err = s.handleUnpackError(err, p, logging.PacketType1RTT)
 		return false, err
 	}
@@ -1067,7 +1078,7 @@ func (s *connection) handleShortHeaderPacket(p receivedPacket) (wasProcessed boo
 			s.logger,
 		)
 	}
-	destConnID, frames, shouldSwitchPath := s.pathManager.HandlePacket(p.remoteAddr, pathChallenge, isNonProbing)
+	destConnID, frames, shouldSwitchPath := s.pathManager.HandlePacket(p.remoteAddr, p.rcvTime, pathChallenge, isNonProbing)
 	if len(frames) > 0 {
 		probe, buf, err := s.packer.PackPathProbePacket(destConnID, frames, s.version)
 		if err != nil {
@@ -2144,10 +2155,11 @@ func (s *connection) sendPackets(now time.Time) error {
 		if err := s.sendPackedCoalescedPacket(packet, s.sentPacketHandler.ECNMode(packet.IsOnlyShortHeaderPacket()), now); err != nil {
 			return err
 		}
-		sendMode := s.sentPacketHandler.SendMode(now)
-		if sendMode == ackhandler.SendPacingLimited {
+		//nolint:exhaustive // only need to handle pacing-related events here
+		switch s.sentPacketHandler.SendMode(now) {
+		case ackhandler.SendPacingLimited:
 			s.resetPacingDeadline()
-		} else if sendMode == ackhandler.SendAny {
+		case ackhandler.SendAny:
 			s.pacingDeadline = deadlineSendImmediately
 		}
 		return nil
@@ -2310,29 +2322,25 @@ func (s *connection) sendProbePacket(sendMode ackhandler.SendMode, now time.Time
 	// Queue probe packets until we actually send out a packet,
 	// or until there are no more packets to queue.
 	var packet *coalescedPacket
-	for {
+	for packet == nil {
 		if wasQueued := s.sentPacketHandler.QueueProbePacket(encLevel); !wasQueued {
 			break
 		}
 		var err error
-		packet, err = s.packer.MaybePackPTOProbePacket(encLevel, s.maxPacketSize(), now, s.version)
+		packet, err = s.packer.PackPTOProbePacket(encLevel, s.maxPacketSize(), false, now, s.version)
 		if err != nil {
 			return err
 		}
-		if packet != nil {
-			break
-		}
 	}
 	if packet == nil {
-		s.retransmissionQueue.AddPing(encLevel)
 		var err error
-		packet, err = s.packer.MaybePackPTOProbePacket(encLevel, s.maxPacketSize(), now, s.version)
+		packet, err = s.packer.PackPTOProbePacket(encLevel, s.maxPacketSize(), true, now, s.version)
 		if err != nil {
 			return err
 		}
 	}
 	if packet == nil || (len(packet.longHdrPackets) == 0 && packet.shortHdrPacket == nil) {
-		return fmt.Errorf("connection BUG: couldn't pack %s probe packet", encLevel)
+		return fmt.Errorf("connection BUG: couldn't pack %s probe packet: %v", encLevel, packet)
 	}
 	return s.sendPackedCoalescedPacket(packet, s.sentPacketHandler.ECNMode(packet.IsOnlyShortHeaderPacket()), now)
 }
@@ -2639,18 +2647,22 @@ func (s *connection) AddPath(t *Transport) (*Path, error) {
 	if err := t.init(false); err != nil {
 		return nil, err
 	}
-	return s.getPathManager().NewPath(t, func() {
-		runner := t.connRunner()
-		s.connIDGenerator.AddConnRunner(
-			t.id(),
-			connRunnerCallbacks{
-				AddConnectionID:    func(connID protocol.ConnectionID) { runner.Add(connID, s) },
-				RemoveConnectionID: runner.Remove,
-				RetireConnectionID: runner.Retire,
-				ReplaceWithClosed:  runner.ReplaceWithClosed,
-			},
-		)
-	}), nil
+	return s.getPathManager().NewPath(
+		t,
+		200*time.Millisecond, // initial RTT estimate
+		func() {
+			runner := t.connRunner()
+			s.connIDGenerator.AddConnRunner(
+				t.id(),
+				connRunnerCallbacks{
+					AddConnectionID:    func(connID protocol.ConnectionID) { runner.Add(connID, s) },
+					RemoveConnectionID: runner.Remove,
+					RetireConnectionID: runner.Retire,
+					ReplaceWithClosed:  runner.ReplaceWithClosed,
+				},
+			)
+		},
+	), nil
 }
 
 func (s *connection) NextConnection(ctx context.Context) (Connection, error) {
