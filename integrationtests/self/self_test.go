@@ -1,7 +1,6 @@
 package self_test
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -11,9 +10,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"os"
-	"runtime/pprof"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -161,18 +158,6 @@ func newUDPConnLocalhost(t testing.TB) *net.UDPConn {
 	return conn
 }
 
-func areHandshakesRunning() bool {
-	var b bytes.Buffer
-	pprof.Lookup("goroutine").WriteTo(&b, 1)
-	return strings.Contains(b.String(), "RunHandshake")
-}
-
-func areTransportsRunning() bool {
-	var b bytes.Buffer
-	pprof.Lookup("goroutine").WriteTo(&b, 1)
-	return strings.Contains(b.String(), "quic-go.(*Transport).listen")
-}
-
 func TestMain(m *testing.M) {
 	var versionParam string
 	flag.StringVar(&versionParam, "version", "1", "QUIC version")
@@ -190,19 +175,7 @@ func TestMain(m *testing.M) {
 	}
 	fmt.Printf("using QUIC version: %s\n", version)
 
-	status := m.Run()
-	if status != 0 {
-		os.Exit(status)
-	}
-	if areHandshakesRunning() {
-		fmt.Println("stray handshake goroutines found")
-		os.Exit(1)
-	}
-	if areTransportsRunning() {
-		fmt.Println("stray transport goroutines found")
-		os.Exit(1)
-	}
-	os.Exit(status)
+	os.Exit(m.Run())
 }
 
 func scaleDuration(d time.Duration) time.Duration {

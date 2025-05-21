@@ -81,7 +81,7 @@ func connectionOptRetrySrcConnID(rcid protocol.ConnectionID) testConnectionOpt {
 
 type testConnection struct {
 	conn       *connection
-	connRunner *MockPacketHandlerManager
+	connRunner *MockConnRunner
 	sendConn   *MockSendConn
 	packer     *MockPacker
 	destConnID protocol.ConnectionID
@@ -101,7 +101,7 @@ func newServerTestConnection(
 	}
 	remoteAddr := &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 4321}
 	localAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234}
-	phm := NewMockPacketHandlerManager(mockCtrl)
+	connRunner := NewMockConnRunner(mockCtrl)
 	sendConn := NewMockSendConn(mockCtrl)
 	sendConn.EXPECT().capabilities().Return(connCapabilities{GSO: gso}).AnyTimes()
 	sendConn.EXPECT().RemoteAddr().Return(remoteAddr).AnyTimes()
@@ -119,7 +119,7 @@ func newServerTestConnection(
 		ctx,
 		cancel,
 		sendConn,
-		&Transport{handlerMap: phm},
+		connRunner,
 		origDestConnID,
 		nil,
 		protocol.ConnectionID{},
@@ -131,6 +131,7 @@ func newServerTestConnection(
 		&tls.Config{},
 		handshake.NewTokenGenerator(handshake.TokenProtectorKey{}),
 		false,
+		1337*time.Millisecond,
 		nil,
 		utils.DefaultLogger,
 		protocol.Version1,
@@ -141,7 +142,7 @@ func newServerTestConnection(
 	}
 	return &testConnection{
 		conn:       conn,
-		connRunner: phm,
+		connRunner: connRunner,
 		sendConn:   sendConn,
 		packer:     packer,
 		destConnID: origDestConnID,
@@ -162,7 +163,7 @@ func newClientTestConnection(
 	}
 	remoteAddr := &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 4321}
 	localAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234}
-	phm := NewMockPacketHandlerManager(mockCtrl)
+	connRunner := NewMockConnRunner(mockCtrl)
 	sendConn := NewMockSendConn(mockCtrl)
 	sendConn.EXPECT().capabilities().Return(connCapabilities{}).AnyTimes()
 	sendConn.EXPECT().RemoteAddr().Return(remoteAddr).AnyTimes()
@@ -178,7 +179,7 @@ func newClientTestConnection(
 	conn := newClientConnection(
 		context.Background(),
 		sendConn,
-		&Transport{handlerMap: phm},
+		connRunner,
 		destConnID,
 		srcConnID,
 		&protocol.DefaultConnectionIDGenerator{},
@@ -198,7 +199,7 @@ func newClientTestConnection(
 	}
 	return &testConnection{
 		conn:       conn,
-		connRunner: phm,
+		connRunner: connRunner,
 		sendConn:   sendConn,
 		packer:     packer,
 		destConnID: destConnID,
@@ -442,7 +443,7 @@ func TestConnectionTransportError(t *testing.T) {
 	b.Data = append(b.Data, []byte("connection close")...)
 	tc.packer.EXPECT().PackConnectionClose(expectedErr, gomock.Any(), protocol.Version1).Return(&coalescedPacket{buffer: b}, nil)
 	tc.sendConn.EXPECT().Write([]byte("connection close"), gomock.Any(), gomock.Any())
-	tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any()).AnyTimes()
+	tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
 	gomock.InOrder(
 		tracer.EXPECT().ClosedConnection(expectedErr),
 		tracer.EXPECT().Close(),
@@ -476,7 +477,7 @@ func TestConnectionApplicationClose(t *testing.T) {
 	b.Data = append(b.Data, []byte("connection close")...)
 	tc.packer.EXPECT().PackApplicationClose(expectedErr, gomock.Any(), protocol.Version1).Return(&coalescedPacket{buffer: b}, nil)
 	tc.sendConn.EXPECT().Write([]byte("connection close"), gomock.Any(), gomock.Any())
-	tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any()).AnyTimes()
+	tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
 	gomock.InOrder(
 		tracer.EXPECT().ClosedConnection(expectedErr),
 		tracer.EXPECT().Close(),
@@ -835,7 +836,7 @@ func testConnectionUnpackFailureFatal(t *testing.T, unpackErr error) error {
 		connectionOptUnpacker(unpacker),
 	)
 
-	tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any())
+	tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any(), gomock.Any())
 	unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).Return(protocol.PacketNumber(0), protocol.PacketNumberLen(0), protocol.KeyPhaseBit(0), nil, unpackErr)
 	tc.packer.EXPECT().PackConnectionClose(gomock.Any(), gomock.Any(), protocol.Version1).Return(&coalescedPacket{buffer: getPacketBuffer()}, nil)
 	errChan := make(chan error, 1)
@@ -952,7 +953,7 @@ func TestConnectionRemoteClose(t *testing.T) {
 	tracer.EXPECT().ReceivedShortHeaderPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any())
 
 	expectedErr := &qerr.TransportError{ErrorCode: qerr.StreamLimitError, Remote: true}
-	tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any())
+	tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any(), gomock.Any())
 	streamErrChan := make(chan error, 1)
 	mockStreamManager.EXPECT().CloseWithError(gomock.Any()).Do(func(e error) { streamErrChan <- e })
 	tracerErrChan := make(chan error, 1)
@@ -1163,7 +1164,6 @@ func TestConnectionHandshakeServer(t *testing.T) {
 	require.NoError(t, err)
 
 	cs.EXPECT().DiscardInitialKeys()
-	tc.connRunner.EXPECT().Retire(gomock.Any())
 	gomock.InOrder(
 		cs.EXPECT().StartHandshake(gomock.Any()),
 		cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventNoEvent}),
@@ -1408,7 +1408,7 @@ func TestConnection0RTTTransportParameters(t *testing.T) {
 	)
 	tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1).Return(nil, nil).AnyTimes()
 	tc.packer.EXPECT().PackConnectionClose(gomock.Any(), gomock.Any(), protocol.Version1).Return(&coalescedPacket{buffer: getPacketBuffer()}, nil)
-	tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any())
+	tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any(), gomock.Any())
 
 	errChan := make(chan error, 1)
 	go func() { errChan <- tc.conn.run() }()
