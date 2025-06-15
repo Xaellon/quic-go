@@ -21,7 +21,7 @@ import (
 
 func TestStreamReadCancellation(t *testing.T) {
 	t.Run("immediate", func(t *testing.T) {
-		testStreamCancellation(t, func(str quic.ReceiveStream) error {
+		testStreamCancellation(t, func(str *quic.ReceiveStream) error {
 			str.CancelRead(quic.StreamErrorCode(str.StreamID()))
 			_, err := str.Read([]byte{0})
 			return err
@@ -29,7 +29,7 @@ func TestStreamReadCancellation(t *testing.T) {
 	})
 
 	t.Run("after reading some data", func(t *testing.T) {
-		testStreamCancellation(t, func(str quic.ReceiveStream) error {
+		testStreamCancellation(t, func(str *quic.ReceiveStream) error {
 			length := rand.IntN(len(PRData) - 1)
 			if _, err := io.ReadAll(io.LimitReader(str, int64(length))); err != nil {
 				return fmt.Errorf("reading stream data failed: %w", err)
@@ -43,7 +43,7 @@ func TestStreamReadCancellation(t *testing.T) {
 	// This test is especially valuable when run with race detector,
 	// see https://github.com/quic-go/quic-go/issues/3239.
 	t.Run("concurrent", func(t *testing.T) {
-		testStreamCancellation(t, func(str quic.ReceiveStream) error {
+		testStreamCancellation(t, func(str *quic.ReceiveStream) error {
 			errChan := make(chan error, 1)
 			go func() {
 				for {
@@ -79,7 +79,7 @@ func TestStreamReadCancellation(t *testing.T) {
 
 func TestStreamWriteCancellation(t *testing.T) {
 	t.Run("immediate", func(t *testing.T) {
-		testStreamCancellation(t, nil, func(str quic.SendStream) error {
+		testStreamCancellation(t, nil, func(str *quic.SendStream) error {
 			str.CancelWrite(quic.StreamErrorCode(str.StreamID()))
 			_, err := str.Write([]byte{0})
 			return err
@@ -87,7 +87,7 @@ func TestStreamWriteCancellation(t *testing.T) {
 	})
 
 	t.Run("after writing some data", func(t *testing.T) {
-		testStreamCancellation(t, nil, func(str quic.SendStream) error {
+		testStreamCancellation(t, nil, func(str *quic.SendStream) error {
 			length := rand.IntN(len(PRData) - 1)
 			if _, err := str.Write(PRData[:length]); err != nil {
 				return fmt.Errorf("writing stream data failed: %w", err)
@@ -101,7 +101,7 @@ func TestStreamWriteCancellation(t *testing.T) {
 	// This test is especially valuable when run with race detector,
 	// see https://github.com/quic-go/quic-go/issues/3239.
 	t.Run("concurrent", func(t *testing.T) {
-		testStreamCancellation(t, nil, func(str quic.SendStream) error {
+		testStreamCancellation(t, nil, func(str *quic.SendStream) error {
 			errChan := make(chan error, 1)
 			go func() {
 				var offset int
@@ -141,12 +141,12 @@ func TestStreamWriteCancellation(t *testing.T) {
 func TestStreamReadWriteCancellation(t *testing.T) {
 	t.Run("immediate", func(t *testing.T) {
 		testStreamCancellation(t,
-			func(str quic.ReceiveStream) error {
+			func(str *quic.ReceiveStream) error {
 				str.CancelRead(quic.StreamErrorCode(str.StreamID()))
 				_, err := str.Read([]byte{0})
 				return err
 			},
-			func(str quic.SendStream) error {
+			func(str *quic.SendStream) error {
 				str.CancelWrite(quic.StreamErrorCode(str.StreamID()))
 				_, err := str.Write([]byte{0})
 				return err
@@ -156,7 +156,7 @@ func TestStreamReadWriteCancellation(t *testing.T) {
 
 	t.Run("after writing some data", func(t *testing.T) {
 		testStreamCancellation(t,
-			func(str quic.ReceiveStream) error {
+			func(str *quic.ReceiveStream) error {
 				length := rand.IntN(len(PRData) - 1)
 				if _, err := io.ReadAll(io.LimitReader(str, int64(length))); err != nil {
 					return fmt.Errorf("reading stream data failed: %w", err)
@@ -165,7 +165,7 @@ func TestStreamReadWriteCancellation(t *testing.T) {
 				_, err := str.Read([]byte{0})
 				return err
 			},
-			func(str quic.SendStream) error {
+			func(str *quic.SendStream) error {
 				length := rand.IntN(len(PRData) - 1)
 				if _, err := str.Write(PRData[:length]); err != nil {
 					return fmt.Errorf("writing stream data failed: %w", err)
@@ -182,8 +182,8 @@ func TestStreamReadWriteCancellation(t *testing.T) {
 // If writeFunc is set, the write side is canceled for 50% of the streams.
 func testStreamCancellation(
 	t *testing.T,
-	readFunc func(str quic.ReceiveStream) error,
-	writeFunc func(str quic.SendStream) error,
+	readFunc func(str *quic.ReceiveStream) error,
+	writeFunc func(str *quic.SendStream) error,
 ) {
 	const numStreams = 80
 
@@ -253,7 +253,7 @@ func testStreamCancellation(
 	for _, doCancel := range actions {
 		str, err := conn.AcceptUniStream(ctx)
 		require.NoError(t, err)
-		go func(str quic.ReceiveStream) {
+		go func(str *quic.ReceiveStream) {
 			if readFunc != nil && doCancel {
 				if err := readFunc(str); err != nil {
 					clientErrChan <- &cancellationErr{StreamID: str.StreamID(), Err: err}
@@ -457,7 +457,7 @@ func TestCancelOpenStreamSync(t *testing.T) {
 				continue
 			}
 			numOpened++
-			go func(str quic.SendStream) {
+			go func(str *quic.SendStream) {
 				defer str.Close()
 				if _, err := str.Write(PRData); err != nil {
 					serverErrChan <- err
@@ -467,11 +467,11 @@ func TestCancelOpenStreamSync(t *testing.T) {
 	}()
 
 	clientErrChan := make(chan error, numStreams)
-	for i := 0; i < numStreams; i++ {
+	for range numStreams {
 		<-msg
 		str, err := conn.AcceptUniStream(context.Background())
 		require.NoError(t, err)
-		go func(str quic.ReceiveStream) {
+		go func(str *quic.ReceiveStream) {
 			data, err := io.ReadAll(str)
 			if err != nil {
 				clientErrChan <- err
@@ -526,7 +526,7 @@ func TestHeavyStreamCancellation(t *testing.T) {
 	serverConn, err := server.Accept(context.Background())
 	require.NoError(t, err)
 
-	handleStream := func(str quic.Stream) {
+	handleStream := func(str *quic.Stream) {
 		str.SetDeadline(time.Now().Add(time.Second))
 		go func() {
 			defer wg.Done()

@@ -3,8 +3,6 @@ package quic
 import (
 	"bytes"
 	"fmt"
-	"io"
-	"log"
 	"net"
 	"os"
 	"runtime/pprof"
@@ -13,26 +11,11 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/wire"
+
 	"github.com/stretchr/testify/require"
-	"go.uber.org/mock/gomock"
 )
-
-func TestQuicGo(t *testing.T) {
-	RegisterFailHandler(Fail)
-	RunSpecs(t, "QUIC Suite")
-}
-
-var mockCtrl *gomock.Controller
-
-var _ = BeforeEach(func() {
-	mockCtrl = gomock.NewController(GinkgoT())
-})
-
-var _ = BeforeSuite(func() {
-	log.SetOutput(io.Discard)
-})
 
 // in the tests for the stream deadlines we set a deadline
 // and wait to make an assertion when Read / Write was unblocked
@@ -56,16 +39,29 @@ func newUDPConnLocalhost(t testing.TB) *net.UDPConn {
 	return conn
 }
 
+func getPacket(t *testing.T, connID protocol.ConnectionID) []byte {
+	return getPacketWithPacketType(t, connID, protocol.PacketTypeHandshake, 2)
+}
+
+func getPacketWithPacketType(t *testing.T, connID protocol.ConnectionID, typ protocol.PacketType, length protocol.ByteCount) []byte {
+	t.Helper()
+	b, err := (&wire.ExtendedHeader{
+		Header: wire.Header{
+			Type:             typ,
+			DestConnectionID: connID,
+			Length:           length,
+			Version:          protocol.Version1,
+		},
+		PacketNumberLen: protocol.PacketNumberLen2,
+	}).Append(nil, protocol.Version1)
+	require.NoError(t, err)
+	return append(b, bytes.Repeat([]byte{42}, int(length)-2)...)
+}
+
 func areConnsRunning() bool {
 	var b bytes.Buffer
 	pprof.Lookup("goroutine").WriteTo(&b, 1)
 	return strings.Contains(b.String(), "quic-go.(*connection).run")
-}
-
-func areServersRunning() bool {
-	var b bytes.Buffer
-	pprof.Lookup("goroutine").WriteTo(&b, 1)
-	return strings.Contains(b.String(), "quic-go.(*baseServer).run")
 }
 
 func areTransportsRunning() bool {
@@ -73,12 +69,6 @@ func areTransportsRunning() bool {
 	pprof.Lookup("goroutine").WriteTo(&b, 1)
 	return strings.Contains(b.String(), "quic-go.(*Transport).listen")
 }
-
-var _ = AfterEach(func() {
-	mockCtrl.Finish()
-	Eventually(areServersRunning).Should(BeFalse())
-	Eventually(areTransportsRunning()).Should(BeFalse())
-})
 
 func TestMain(m *testing.M) {
 	status := m.Run()

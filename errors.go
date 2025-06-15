@@ -41,8 +41,8 @@ const (
 	NoViablePathError         = qerr.NoViablePathError
 )
 
-// A StreamError is used for Stream.CancelRead and Stream.CancelWrite.
-// It is also returned from Stream.Read and Stream.Write if the peer canceled reading or writing.
+// A StreamError is used to signal stream cancellations.
+// It is returned from the Read and Write methods of the [ReceiveStream], [SendStream] and [Stream].
 type StreamError struct {
 	StreamID  StreamID
 	ErrorCode StreamErrorCode
@@ -62,7 +62,7 @@ func (e *StreamError) Error() string {
 	return fmt.Sprintf("stream %d canceled by %s with error code %d", e.StreamID, pers, e.ErrorCode)
 }
 
-// DatagramTooLargeError is returned from Connection.SendDatagram if the payload is too large to be sent.
+// DatagramTooLargeError is returned from Conn.SendDatagram if the payload is too large to be sent.
 type DatagramTooLargeError struct {
 	MaxDatagramPayloadSize int64
 }

@@ -56,10 +56,10 @@ func TestGracefulShutdownShortRequest(t *testing.T) {
 		w.Write([]byte("shutdown"))
 	})
 
-	connChan := make(chan quic.EarlyConnection, 1)
+	connChan := make(chan *quic.Conn, 1)
 	tr := &http3.Transport{
 		TLSClientConfig: getTLSClientConfigWithoutServerName(),
-		Dial: func(ctx context.Context, a string, tlsConf *tls.Config, conf *quic.Config) (quic.EarlyConnection, error) {
+		Dial: func(ctx context.Context, a string, tlsConf *tls.Config, conf *quic.Config) (*quic.Conn, error) {
 			addr, err := net.ResolveUDPAddr("udp", a)
 			if err != nil {
 				return nil, err
@@ -80,7 +80,7 @@ func TestGracefulShutdownShortRequest(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	var conn quic.EarlyConnection
+	var conn *quic.Conn
 	select {
 	case conn = <-connChan:
 	default:
@@ -140,10 +140,10 @@ func TestGracefulShutdownIdleConnection(t *testing.T) {
 	var server *http3.Server
 	port := startHTTPServer(t, http.NewServeMux(), func(s *http3.Server) { server = s })
 
-	connChan := make(chan quic.EarlyConnection, 1)
+	connChan := make(chan *quic.Conn, 1)
 	tr := &http3.Transport{
 		TLSClientConfig: getTLSClientConfigWithoutServerName(),
-		Dial: func(ctx context.Context, a string, tlsConf *tls.Config, conf *quic.Config) (quic.EarlyConnection, error) {
+		Dial: func(ctx context.Context, a string, tlsConf *tls.Config, conf *quic.Config) (*quic.Conn, error) {
 			addr, err := net.ResolveUDPAddr("udp", a)
 			if err != nil {
 				return nil, err
@@ -165,7 +165,7 @@ func TestGracefulShutdownIdleConnection(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 	require.NoError(t, resp.Body.Close())
 
-	var conn quic.EarlyConnection
+	var conn *quic.Conn
 	select {
 	case conn = <-connChan:
 	default:
@@ -263,11 +263,15 @@ func TestGracefulShutdownPendingStreams(t *testing.T) {
 	})
 	var server *http3.Server
 	port := startHTTPServer(t, mux, func(s *http3.Server) { server = s })
-	connChan := make(chan quic.EarlyConnection, 1)
+	connChan := make(chan *quic.Conn, 1)
 	tr := &http3.Transport{
 		TLSClientConfig: getTLSClientConfigWithoutServerName(),
-		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
-			conn, err := quic.DialAddrEarly(ctx, addr, tlsCfg, cfg)
+		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+			a, err := net.ResolveUDPAddr("udp", addr)
+			if err != nil {
+				return nil, err
+			}
+			conn, err := quic.DialEarly(ctx, newUDPConnLocalhost(t), a, tlsCfg, cfg)
 			connChan <- conn
 			return conn, err
 		},
@@ -275,18 +279,15 @@ func TestGracefulShutdownPendingStreams(t *testing.T) {
 	cl := &http.Client{Transport: tr}
 
 	proxy := quicproxy.Proxy{
-		Conn:       newUDPConnLocalhost(t),
-		ServerAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port},
-		DelayPacket: func(_ quicproxy.Direction, _, _ net.Addr, data []byte) time.Duration {
-			return rtt
-		},
+		Conn:        newUDPConnLocalhost(t),
+		ServerAddr:  &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port},
+		DelayPacket: func(_ quicproxy.Direction, _, _ net.Addr, _ []byte) time.Duration { return rtt },
 	}
 	require.NoError(t, proxy.Start())
 	defer proxy.Close()
-	proxyPort := proxy.LocalAddr().(*net.UDPAddr).Port
 
 	errChan := make(chan error, 1)
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://localhost:%d/helloworld", proxyPort), nil)
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://%s/helloworld", proxy.LocalAddr()), nil)
 	require.NoError(t, err)
 	go func() {
 		resp, err := cl.Do(req)
@@ -310,7 +311,7 @@ func TestGracefulShutdownPendingStreams(t *testing.T) {
 	go func() { shutdownChan <- server.Shutdown(ctx) }()
 	time.Sleep(rtt / 2) // wait for the server to start shutting down
 
-	var conn quic.EarlyConnection
+	var conn *quic.Conn
 	select {
 	case conn = <-connChan:
 	case <-time.After(time.Second):
@@ -367,6 +368,7 @@ func testHTTP3ListenerClosing(t *testing.T, graceful, useApplicationListener boo
 		tlsConf.NextProtos = []string{http3.NextProtoH3}
 		tr := &http3.Transport{TLSClientConfig: tlsConf}
 		defer tr.Close()
+		addDialCallback(t, tr)
 		cl := &http.Client{Transport: tr}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 		require.NoError(t, err)
@@ -395,7 +397,7 @@ func testHTTP3ListenerClosing(t *testing.T, graceful, useApplicationListener boo
 		// the following values will be ignored when using ServeListener
 		TLSConfig:  tlsConf,
 		QUICConfig: getQuicConfig(nil),
-		Addr:       "127.0.0.1:47283",
+		Addr:       "127.0.0.1:0",
 	}
 
 	serveChan := make(chan error, 1)
@@ -410,7 +412,17 @@ func testHTTP3ListenerClosing(t *testing.T, graceful, useApplicationListener boo
 		go func() { serveChan <- server.ServeListener(ln) }()
 	} else {
 		go func() { serveChan <- server.ListenAndServe() }()
-		host = server.Addr
+		// The server is listening on a random port, and the only way to get the port
+		// is to parse the Alt-Svc header.
+		var port int
+		require.Eventually(t, func() bool {
+			hdr := make(http.Header)
+			server.SetQUICHeaders(hdr)
+			altSvc := hdr.Get("Alt-Svc")
+			n, err := fmt.Sscanf(altSvc, `h3=":%d"`, &port)
+			return err == nil && n == 1
+		}, time.Second, 10*time.Millisecond)
+		host = fmt.Sprintf("127.0.0.1:%d", port)
 	}
 
 	u := &url.URL{Scheme: "https", Host: host, Path: "/ok"}
@@ -470,10 +482,7 @@ func testHTTP3ListenerClosing(t *testing.T, graceful, useApplicationListener boo
 		for range 2 {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			err := dial(t, ctx, u)
-			var h3Err *http3.Error
-			require.ErrorAs(t, err, &h3Err)
-			require.Equal(t, http3.ErrCode(1337), h3Err.ErrorCode)
+			require.ErrorIs(t, dial(t, ctx, u), &http3.Error{ErrorCode: 1337, Remote: true})
 			select {
 			case err := <-errChan:
 				require.NoError(t, err)
