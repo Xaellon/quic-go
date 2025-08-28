@@ -189,6 +189,11 @@ type Config struct {
 	// Enable QUIC Stream Resets with Partial Delivery.
 	// See https://datatracker.ietf.org/doc/html/draft-ietf-quic-reliable-stream-reset-07.
 	EnableStreamResetPartialDelivery bool
+	// MaxPacingRate is the maximum rate at which packets are sent, in bits per second (bps).
+	// It is used to limit the bandwidth used by a connection.
+	// This value must be set and cannot be zero.
+	// Values higher than the available network bandwidth may lead to unexpected results.
+	MaxPacingRate uint64
 
 	Tracer func(ctx context.Context, isClient bool, connID ConnectionID) qlogwriter.Trace
 }

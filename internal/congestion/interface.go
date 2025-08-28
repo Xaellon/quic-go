@@ -25,3 +25,8 @@ type SendAlgorithmWithDebugInfos interface {
 	InRecovery() bool
 	GetCongestionWindow() protocol.ByteCount
 }
+
+// HandleAggregatedAcks is invoked after all OnPacketAcked callbacks have been processed.
+type HandleAggregatedAcks interface {
+	OnAcksEnd(priorInFlight protocol.ByteCount, eventTime time.Time)
+}

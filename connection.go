@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go/internal/ackhandler"
+	"github.com/quic-go/quic-go/internal/congestion"
 	"github.com/quic-go/quic-go/internal/flowcontrol"
 	"github.com/quic-go/quic-go/internal/handshake"
 	"github.com/quic-go/quic-go/internal/monotime"
@@ -317,6 +318,8 @@ var newConnection = func(
 		s.conn.capabilities().ECN,
 		s.perspective,
 		s.qlogger,
+		congestion.Bandwidth(s.config.MaxPacingRate),
+		s.tracer,
 		s.logger,
 	)
 	s.currentMTUEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
@@ -445,6 +448,8 @@ var newClientConnection = func(
 		s.conn.capabilities().ECN,
 		s.perspective,
 		s.qlogger,
+		congestion.Bandwidth(s.config.MaxPacingRate),
+		s.tracer,
 		s.logger,
 	)
 	s.currentMTUEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))

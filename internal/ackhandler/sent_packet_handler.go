@@ -134,18 +134,10 @@ func newSentPacketHandler(
 	clientAddressValidated bool,
 	enableECN bool,
 	pers protocol.Perspective,
+	maxPacingRate congestion.Bandwidth,
 	qlogger qlogwriter.Recorder,
 	logger utils.Logger,
 ) *sentPacketHandler {
-	congestion := congestion.NewCubicSender(
-		congestion.DefaultClock{},
-		rttStats,
-		connStats,
-		initialMaxDatagramSize,
-		true, // use Reno
-		qlogger,
-	)
-
 	h := &sentPacketHandler{
 		peerCompletedAddressValidation: pers == protocol.PerspectiveServer,
 		peerAddressValidated:           pers == protocol.PerspectiveClient || clientAddressValidated,
@@ -155,11 +147,19 @@ func newSentPacketHandler(
 		lostPackets:                    *newLostPacketTracker(64),
 		rttStats:                       rttStats,
 		connStats:                      connStats,
-		congestion:                     congestion,
 		perspective:                    pers,
 		qlogger:                        qlogger,
 		logger:                         logger,
 	}
+	congestion := congestion.NewBbrSender(
+		rttStats,
+		initialMaxDatagramSize,
+		maxPacingRate,
+		func() protocol.ByteCount {
+			return h.bytesInFlight
+		},
+	)
+	h.congestion = congestion
 	if enableECN {
 		h.enableECN = true
 		h.ecnTracker = newECNTracker(logger, qlogger)
@@ -443,6 +443,10 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		)
 		// clean up lost packet history
 		h.lostPackets.DeleteBefore(rcvTime.Add(-3 * h.rttStats.PTO(false)))
+	}
+
+	if intf, ok := h.congestion.(congestion.HandleAggregatedAcks); ok {
+		intf.OnAcksEnd(priorInFlight, rcvTime)
 	}
 
 	// After this point, we must not use ackedPackets any longer!

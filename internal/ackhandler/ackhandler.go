@@ -1,6 +1,7 @@
 package ackhandler
 
 import (
+	"github.com/quic-go/quic-go/internal/congestion"
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/utils"
 	"github.com/quic-go/quic-go/qlogwriter"
@@ -17,9 +18,10 @@ func NewAckHandler(
 	clientAddressValidated bool,
 	enableECN bool,
 	pers protocol.Perspective,
+	maxPacingRate congestion.Bandwidth,
 	qlogger qlogwriter.Recorder,
 	logger utils.Logger,
 ) (SentPacketHandler, ReceivedPacketHandler) {
-	sph := newSentPacketHandler(initialPacketNumber, initialMaxDatagramSize, rttStats, connStats, clientAddressValidated, enableECN, pers, qlogger, logger)
+	sph := newSentPacketHandler(initialPacketNumber, initialMaxDatagramSize, rttStats, connStats, clientAddressValidated, enableECN, pers, maxPacingRate, qlogger, logger)
 	return sph, newReceivedPacketHandler(sph, logger)
 }
