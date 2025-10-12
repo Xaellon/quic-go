@@ -22,6 +22,29 @@ type frame any
 
 var errHijacked = errors.New("hijacked")
 
+type countingByteReader struct {
+	quicvarint.Reader
+	NumRead int
+}
+
+func (r *countingByteReader) ReadByte() (byte, error) {
+	b, err := r.Reader.ReadByte()
+	if err == nil {
+		r.NumRead++
+	}
+	return b, err
+}
+
+func (r *countingByteReader) Read(b []byte) (int, error) {
+	n, err := r.Reader.Read(b)
+	r.NumRead += n
+	return n, err
+}
+
+func (r *countingByteReader) Reset() {
+	r.NumRead = 0
+}
+
 type frameParser struct {
 	r                   io.Reader
 	streamID            quic.StreamID
@@ -30,9 +53,9 @@ type frameParser struct {
 }
 
 func (p *frameParser) ParseNext(qlogger qlogwriter.Recorder) (frame, error) {
-	qr := quicvarint.NewReader(p.r)
+	r := &countingByteReader{Reader: quicvarint.NewReader(p.r)}
 	for {
-		t, err := quicvarint.Read(qr)
+		t, err := quicvarint.Read(r)
 		if err != nil {
 			if p.unknownFrameHandler != nil {
 				hijacked, err := p.unknownFrameHandler(0, err)
@@ -56,48 +79,83 @@ func (p *frameParser) ParseNext(qlogger qlogwriter.Recorder) (frame, error) {
 			}
 			// If the unknownFrameHandler didn't process the frame, it is our responsibility to skip it.
 		}
-		l, err := quicvarint.Read(qr)
+		l, err := quicvarint.Read(r)
 		if err != nil {
 			return nil, err
 		}
 
 		switch t {
-		case 0x0:
+		case 0x0: // DATA
 			if qlogger != nil {
 				qlogger.RecordEvent(qlog.FrameParsed{
 					StreamID: p.streamID,
-					Raw:      qlog.RawInfo{PayloadLength: int(l)},
-					Frame:    qlog.Frame{Frame: qlog.DataFrame{}},
+					Raw: qlog.RawInfo{
+						Length:        int(l) + r.NumRead,
+						PayloadLength: int(l),
+					},
+					Frame: qlog.Frame{Frame: qlog.DataFrame{}},
 				})
 			}
 			return &dataFrame{Length: l}, nil
-		case 0x1:
-			return &headersFrame{Length: l}, nil
-		case 0x4:
-			return parseSettingsFrame(p.r, l, p.streamID, qlogger)
-		case 0x3: // CANCEL_PUSH
-		case 0x5: // PUSH_PROMISE
-		case 0x7:
-			f, err := parseGoAwayFrame(qr, l)
-			if err != nil {
-				return nil, err
-			}
+		case 0x1: // HEADERS
+			return &headersFrame{
+				Length:    l,
+				headerLen: r.NumRead,
+			}, nil
+		case 0x4: // SETTINGS
+			return parseSettingsFrame(r, l, p.streamID, qlogger)
+		case 0x3: // unsupported: CANCEL_PUSH
 			if qlogger != nil {
 				qlogger.RecordEvent(qlog.FrameParsed{
 					StreamID: p.streamID,
-					Frame:    qlog.Frame{Frame: qlog.GoAwayFrame{StreamID: f.StreamID}},
+					Raw:      qlog.RawInfo{Length: r.NumRead, PayloadLength: int(l)},
+					Frame:    qlog.Frame{Frame: qlog.CancelPushFrame{}},
 				})
 			}
-			return f, nil
-		case 0xd: // MAX_PUSH_ID
-		case 0x2, 0x6, 0x8, 0x9:
+		case 0x5: // unsupported: PUSH_PROMISE
+			if qlogger != nil {
+				qlogger.RecordEvent(qlog.FrameParsed{
+					StreamID: p.streamID,
+					Raw:      qlog.RawInfo{Length: r.NumRead, PayloadLength: int(l)},
+					Frame:    qlog.Frame{Frame: qlog.PushPromiseFrame{}},
+				})
+			}
+		case 0x7: // GOAWAY
+			return parseGoAwayFrame(r, l, p.streamID, qlogger)
+		case 0xd: // unsupported: MAX_PUSH_ID
+			if qlogger != nil {
+				qlogger.RecordEvent(qlog.FrameParsed{
+					StreamID: p.streamID,
+					Raw:      qlog.RawInfo{Length: r.NumRead, PayloadLength: int(l)},
+					Frame:    qlog.Frame{Frame: qlog.MaxPushIDFrame{}},
+				})
+			}
+		case 0x2, 0x6, 0x8, 0x9: // reserved frame types
+			if qlogger != nil {
+				qlogger.RecordEvent(qlog.FrameParsed{
+					StreamID: p.streamID,
+					Raw:      qlog.RawInfo{Length: r.NumRead + int(l), PayloadLength: int(l)},
+					Frame:    qlog.Frame{Frame: qlog.ReservedFrame{Type: t}},
+				})
+			}
 			p.closeConn(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "")
 			return nil, fmt.Errorf("http3: reserved frame type: %d", t)
+		default:
+			// unknown frame types
+			if qlogger != nil {
+				qlogger.RecordEvent(qlog.FrameParsed{
+					StreamID: p.streamID,
+					Raw:      qlog.RawInfo{Length: r.NumRead, PayloadLength: int(l)},
+					Frame:    qlog.Frame{Frame: qlog.UnknownFrame{Type: t}},
+				})
+			}
 		}
-		// skip over unknown frames
-		if _, err := io.CopyN(io.Discard, qr, int64(l)); err != nil {
+
+		// skip over the payload
+		if _, err := io.CopyN(io.Discard, r, int64(l)); err != nil {
 			return nil, err
 		}
+		r.Reset()
 	}
 }
 
@@ -111,7 +169,8 @@ func (f *dataFrame) Append(b []byte) []byte {
 }
 
 type headersFrame struct {
-	Length uint64
+	Length    uint64
+	headerLen int // number of bytes read for type and length field
 }
 
 func (f *headersFrame) Append(b []byte) []byte {
@@ -137,7 +196,7 @@ func pointer[T any](v T) *T {
 	return &v
 }
 
-func parseSettingsFrame(r io.Reader, l uint64, streamID quic.StreamID, qlogger qlogwriter.Recorder) (*settingsFrame, error) {
+func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID, qlogger qlogwriter.Recorder) (*settingsFrame, error) {
 	if l > 8*(1<<10) {
 		return nil, fmt.Errorf("unexpected size for SETTINGS frame: %d", l)
 	}
@@ -202,8 +261,11 @@ func parseSettingsFrame(r io.Reader, l uint64, streamID quic.StreamID, qlogger q
 
 		qlogger.RecordEvent(qlog.FrameParsed{
 			StreamID: streamID,
-			Raw:      qlog.RawInfo{PayloadLength: len(buf)},
-			Frame:    qlog.Frame{Frame: settingsFrame},
+			Raw: qlog.RawInfo{
+				Length:        r.NumRead,
+				PayloadLength: int(l),
+			},
+			Frame: qlog.Frame{Frame: settingsFrame},
 		})
 	}
 	return frame, nil
@@ -241,17 +303,24 @@ type goAwayFrame struct {
 	StreamID quic.StreamID
 }
 
-func parseGoAwayFrame(r io.ByteReader, l uint64) (*goAwayFrame, error) {
+func parseGoAwayFrame(r *countingByteReader, l uint64, streamID quic.StreamID, qlogger qlogwriter.Recorder) (*goAwayFrame, error) {
 	frame := &goAwayFrame{}
-	cbr := countingByteReader{ByteReader: r}
-	id, err := quicvarint.Read(&cbr)
+	startLen := r.NumRead
+	id, err := quicvarint.Read(r)
 	if err != nil {
 		return nil, err
 	}
-	if cbr.Read != int(l) {
+	if r.NumRead-startLen != int(l) {
 		return nil, errors.New("GOAWAY frame: inconsistent length")
 	}
 	frame.StreamID = quic.StreamID(id)
+	if qlogger != nil {
+		qlogger.RecordEvent(qlog.FrameParsed{
+			StreamID: streamID,
+			Raw:      qlog.RawInfo{Length: r.NumRead, PayloadLength: int(l)},
+			Frame:    qlog.Frame{Frame: qlog.GoAwayFrame{StreamID: frame.StreamID}},
+		})
+	}
 	return frame, nil
 }
 
