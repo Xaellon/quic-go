@@ -28,5 +28,5 @@ type SendAlgorithmWithDebugInfos interface {
 
 // HandleAggregatedAcks is invoked after all OnPacketAcked callbacks have been processed.
 type HandleAggregatedAcks interface {
-	OnAcksEnd(priorInFlight protocol.ByteCount, eventTime time.Time)
+	OnAcksEnd(priorInFlight protocol.ByteCount, eventTime monotime.Time)
 }

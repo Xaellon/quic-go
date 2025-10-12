@@ -3,6 +3,7 @@ package congestion
 import (
 	"time"
 
+	"github.com/quic-go/quic-go/internal/monotime"
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/utils"
 )
@@ -132,7 +133,7 @@ type bbrSender struct {
 	// triggers PROBE_RTT mode) if no new value is sampled during that period.
 	minRtt time.Duration
 	// The time at which the current value of |min_rtt_| was assigned.
-	minRttTimestamp time.Time
+	minRttTimestamp monotime.Time
 
 	// The maximum allowed number of bytes in flight.
 	congestionWindow protocol.ByteCount
@@ -172,7 +173,7 @@ type bbrSender struct {
 	// pacing gain cycle.
 	cycleCurrentOffset int
 	// The time at which the last pacing gain cycle was started.
-	lastCycleStart time.Time
+	lastCycleStart monotime.Time
 
 	// Indicates whether the connection has reached the full bandwidth mode.
 	isAtFullBandwidth bool
@@ -187,7 +188,7 @@ type bbrSender struct {
 	// Time at which PROBE_RTT has to be exited. Setting it to zero indicates
 	// that the time is yet unknown as the number of packets in flight has not
 	// reached the required value.
-	exitProbeRttAt time.Time
+	exitProbeRttAt monotime.Time
 	// Indicates whether a round-trip has passed since PROBE_RTT became active.
 	probeRttRoundPassed bool
 
@@ -288,15 +289,15 @@ func NewBbrSender(
 	return b
 }
 
-func (b *bbrSender) TimeUntilSend(bytesInFlight protocol.ByteCount) time.Time {
+func (b *bbrSender) TimeUntilSend(bytesInFlight protocol.ByteCount) monotime.Time {
 	return b.pacer.TimeUntilSend()
 }
 
-func (b *bbrSender) HasPacingBudget(now time.Time) bool {
+func (b *bbrSender) HasPacingBudget(now monotime.Time) bool {
 	return b.pacer.Budget(now) >= b.maxDatagramSize
 }
 
-func (b *bbrSender) OnPacketSent(sentTime time.Time, bytesInFlight protocol.ByteCount, packetNumber protocol.PacketNumber, bytesSent protocol.ByteCount, isRetransmittable bool) {
+func (b *bbrSender) OnPacketSent(sentTime monotime.Time, bytesInFlight protocol.ByteCount, packetNumber protocol.PacketNumber, bytesSent protocol.ByteCount, isRetransmittable bool) {
 	// Notify the pacer about the sent packet.
 	b.pacer.SentPacket(sentTime, bytesSent)
 
@@ -306,7 +307,7 @@ func (b *bbrSender) OnPacketSent(sentTime time.Time, bytesInFlight protocol.Byte
 	}
 
 	// Notify the sampler about the sent packet.
-	b.sampler.OnPacketSent(sentTime, bytesInFlight, packetNumber, bytesSent, isRetransmittable)
+	b.sampler.OnPacketSent(sentTime.ToTime(), bytesInFlight, packetNumber, bytesSent, isRetransmittable)
 }
 
 func (b *bbrSender) CanSend(bytesInFlight protocol.ByteCount) bool {
@@ -317,11 +318,11 @@ func (b *bbrSender) MaybeExitSlowStart() {
 	// not implemented
 }
 
-func (b *bbrSender) OnPacketAcked(packetNumber protocol.PacketNumber, ackedBytes protocol.ByteCount, priorInFlight protocol.ByteCount, eventTime time.Time) {
+func (b *bbrSender) OnPacketAcked(packetNumber protocol.PacketNumber, ackedBytes protocol.ByteCount, priorInFlight protocol.ByteCount, eventTime monotime.Time) {
 	b.packetsAcked = append(b.packetsAcked, packetNumber)
 }
 
-func (b *bbrSender) OnAcksEnd(priorInFlight protocol.ByteCount, eventTime time.Time) {
+func (b *bbrSender) OnAcksEnd(priorInFlight protocol.ByteCount, eventTime monotime.Time) {
 	if len(b.packetsAcked) == 0 && len(b.packetsLost) == 0 {
 		return
 	}
@@ -343,7 +344,7 @@ func (b *bbrSender) OnAcksEnd(priorInFlight protocol.ByteCount, eventTime time.T
 		)
 	}
 
-	sample := b.sampler.OnAcksEnd(eventTime,
+	sample := b.sampler.OnAcksEnd(eventTime.ToTime(),
 		b.packetsAcked, b.packetsLost, b.maxBandwidth.GetBest(), b.maxPacingRate, b.roundTripCount)
 	if sample.lastPacketSendState.isValid {
 		b.lastSampleIsAppLimited = sample.lastPacketSendState.isAppLimited
@@ -533,7 +534,7 @@ func (b *bbrSender) probeRttCongestionWindow() protocol.ByteCount {
 	return b.minCongestionWindow
 }
 
-func (b *bbrSender) maybeUpdateMinRtt(now time.Time, sampleMinRtt time.Duration) bool {
+func (b *bbrSender) maybeUpdateMinRtt(now monotime.Time, sampleMinRtt time.Duration) bool {
 	minRttExpired := b.minRtt != 0 && now.After(b.minRttTimestamp.Add(minRttExpiry))
 
 	if minRttExpired || sampleMinRtt < b.minRtt || b.minRtt == 0 {
@@ -546,13 +547,13 @@ func (b *bbrSender) maybeUpdateMinRtt(now time.Time, sampleMinRtt time.Duration)
 	return minRttExpired
 }
 
-func (b *bbrSender) enterStartupMode(now time.Time) {
+func (b *bbrSender) enterStartupMode(now monotime.Time) {
 	b.mode = bbrModeStartup
 	b.pacingGain = b.highGain
 	b.congestionWindowGain = b.highCwndGain
 }
 
-func (b *bbrSender) enterProbeBandwidthMode(now time.Time) {
+func (b *bbrSender) enterProbeBandwidthMode(now monotime.Time) {
 	b.mode = bbrModeProbeBw
 	b.congestionWindowGain = b.congestionWindowGainConstant
 
@@ -578,7 +579,7 @@ func (b *bbrSender) updateRoundTripCounter(lastAckedPacket protocol.PacketNumber
 	return false
 }
 
-func (b *bbrSender) updateGainCyclePhase(now time.Time, priorInFlight protocol.ByteCount, hasLosses bool) {
+func (b *bbrSender) updateGainCyclePhase(now monotime.Time, priorInFlight protocol.ByteCount, hasLosses bool) {
 	// In most cases, the cycle is advanced after an RTT passes.
 	shouldAdvanceGainCycling := now.After(b.lastCycleStart.Add(b.getMinRtt()))
 
@@ -661,7 +662,7 @@ func (b *bbrSender) maybeAppLimited(bytesInFlight protocol.ByteCount) {
 	}
 }
 
-func (b *bbrSender) maybeExitStartupOrDrain(now time.Time) {
+func (b *bbrSender) maybeExitStartupOrDrain(now monotime.Time) {
 	if b.mode == bbrModeStartup && b.isAtFullBandwidth {
 		b.mode = bbrModeDrain
 		b.pacingGain = b.drainGain
@@ -673,7 +674,7 @@ func (b *bbrSender) maybeExitStartupOrDrain(now time.Time) {
 	}
 }
 
-func (b *bbrSender) maybeEnterOrExitProbeRtt(now time.Time, isRoundStart, minRttExpired bool) {
+func (b *bbrSender) maybeEnterOrExitProbeRtt(now monotime.Time, isRoundStart, minRttExpired bool) {
 	// Check if conditions to enter PROBE_RTT mode are met.
 	if minRttExpired && !b.exitingQuiescence && b.mode != bbrModeProbeRtt {
 		b.mode = bbrModeProbeRtt
@@ -681,7 +682,7 @@ func (b *bbrSender) maybeEnterOrExitProbeRtt(now time.Time, isRoundStart, minRtt
 
 		// Do not decide on the time to exit PROBE_RTT until |bytes_in_flight|
 		// reaches the target small value.
-		b.exitProbeRttAt = time.Time{}
+		b.exitProbeRttAt = monotime.Time(0)
 	}
 
 	if b.mode == bbrModeProbeRtt {

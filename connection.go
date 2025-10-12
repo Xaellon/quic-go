@@ -317,9 +317,8 @@ var newConnection = func(
 		clientAddressValidated,
 		s.conn.capabilities().ECN,
 		s.perspective,
-		s.qlogger,
 		congestion.Bandwidth(s.config.MaxPacingRate),
-		s.tracer,
+		s.qlogger,
 		s.logger,
 	)
 	s.currentMTUEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
@@ -447,9 +446,8 @@ var newClientConnection = func(
 		false, // has no effect
 		s.conn.capabilities().ECN,
 		s.perspective,
-		s.qlogger,
 		congestion.Bandwidth(s.config.MaxPacingRate),
-		s.tracer,
+		s.qlogger,
 		s.logger,
 	)
 	s.currentMTUEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
