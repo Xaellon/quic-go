@@ -307,7 +307,7 @@ func (b *bbrSender) OnPacketSent(sentTime monotime.Time, bytesInFlight protocol.
 	}
 
 	// Notify the sampler about the sent packet.
-	b.sampler.OnPacketSent(sentTime.ToTime(), bytesInFlight, packetNumber, bytesSent, isRetransmittable)
+	b.sampler.OnPacketSent(sentTime, bytesInFlight, packetNumber, bytesSent, isRetransmittable)
 }
 
 func (b *bbrSender) CanSend(bytesInFlight protocol.ByteCount) bool {
@@ -344,7 +344,7 @@ func (b *bbrSender) OnAcksEnd(priorInFlight protocol.ByteCount, eventTime monoti
 		)
 	}
 
-	sample := b.sampler.OnAcksEnd(eventTime.ToTime(),
+	sample := b.sampler.OnAcksEnd(eventTime,
 		b.packetsAcked, b.packetsLost, b.maxBandwidth.GetBest(), b.maxPacingRate, b.roundTripCount)
 	if sample.lastPacketSendState.isValid {
 		b.lastSampleIsAppLimited = sample.lastPacketSendState.isAppLimited

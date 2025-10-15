@@ -151,15 +151,25 @@ func newSentPacketHandler(
 		qlogger:                        qlogger,
 		logger:                         logger,
 	}
-	congestion := congestion.NewBbrSender(
-		rttStats,
-		initialMaxDatagramSize,
-		maxPacingRate,
-		func() protocol.ByteCount {
-			return h.bytesInFlight
-		},
-	)
-	h.congestion = congestion
+	if maxPacingRate > 0 {
+		h.congestion = congestion.NewBbrSender(
+			rttStats,
+			initialMaxDatagramSize,
+			maxPacingRate,
+			func() protocol.ByteCount {
+				return h.bytesInFlight
+			},
+		)
+	} else {
+		h.congestion = congestion.NewCubicSender(
+			congestion.DefaultClock{},
+			rttStats,
+			connStats,
+			initialMaxDatagramSize,
+			true, // use Reno
+			qlogger,
+		)
+	}
 	if enableECN {
 		h.enableECN = true
 		h.ecnTracker = newECNTracker(logger, qlogger)
@@ -435,6 +445,10 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		}
 	}
 
+	if intf, ok := h.congestion.(congestion.HandleAggregatedAcks); ok {
+		intf.OnAcksEnd(priorInFlight, rcvTime)
+	}
+
 	// detect spurious losses for application data packets, if the ACK was not reordered
 	if encLevel == protocol.Encryption1RTT && largestAcked == pnSpace.largestAcked {
 		h.detectSpuriousLosses(
@@ -443,10 +457,6 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		)
 		// clean up lost packet history
 		h.lostPackets.DeleteBefore(rcvTime.Add(-3 * h.rttStats.PTO(false)))
-	}
-
-	if intf, ok := h.congestion.(congestion.HandleAggregatedAcks); ok {
-		intf.OnAcksEnd(priorInFlight, rcvTime)
 	}
 
 	// After this point, we must not use ackedPackets any longer!
