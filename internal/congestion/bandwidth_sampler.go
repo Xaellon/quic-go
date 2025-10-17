@@ -93,7 +93,7 @@ type bandwidthSample struct {
 
 func newBandwidthSample() *bandwidthSample {
 	return &bandwidthSample{
-		sendRate: infBandwidth,
+		sendRate: math.MaxUint64,
 	}
 }
 
@@ -654,7 +654,7 @@ func (b *bandwidthSampler) OnAcksEnd(
 			eventSample.sampleIsAppLimited = sample.stateAtSend.isAppLimited
 		}
 
-		if sample.sendRate != infBandwidth {
+		if sample.sendRate != math.MaxUint64 {
 			maxSendRate = Max(maxSendRate, sample.sendRate)
 		}
 
@@ -816,7 +816,7 @@ func (b *bandwidthSampler) onPacketAcknowledged(eventTime monotime.Time, packetN
 
 	// Infinite rate indicates that the sampler is supposed to discard the
 	// current send rate sample and use only the ack rate.
-	sendRate := infBandwidth
+	sendRate := math.MaxUint64
 	if sentPacketPointer.sentTime.After(sentPacketPointer.lastAckedPacketSentTime) {
 		sendRate = BandwidthFromDelta(
 			sentPacketPointer.sendTimeState.totalBytesSent-sentPacketPointer.totalBytesSentAtLastAckedPacket,
