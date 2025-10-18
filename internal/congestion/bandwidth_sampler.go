@@ -816,7 +816,7 @@ func (b *bandwidthSampler) onPacketAcknowledged(eventTime monotime.Time, packetN
 
 	// Infinite rate indicates that the sampler is supposed to discard the
 	// current send rate sample and use only the ack rate.
-	sendRate := math.MaxUint64
+	sendRate := Bandwidth(math.MaxUint64)
 	if sentPacketPointer.sentTime.After(sentPacketPointer.lastAckedPacketSentTime) {
 		sendRate = BandwidthFromDelta(
 			sentPacketPointer.sendTimeState.totalBytesSent-sentPacketPointer.totalBytesSentAtLastAckedPacket,
