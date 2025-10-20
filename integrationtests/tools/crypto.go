@@ -14,18 +14,12 @@ import (
 
 const ALPN = "quic-go integration tests"
 
-// use a very long validity period to cover the synthetic clock used in synctest
-var (
-	notBefore = time.Date(1990, 1, 1, 0, 0, 0, 0, time.UTC)
-	notAfter  = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
-)
-
 func GenerateCA() (*x509.Certificate, crypto.PrivateKey, error) {
 	certTempl := &x509.Certificate{
 		SerialNumber:          big.NewInt(2019),
 		Subject:               pkix.Name{},
-		NotBefore:             notBefore,
-		NotAfter:              notAfter,
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
 		IsCA:                  true,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
@@ -51,8 +45,8 @@ func GenerateLeafCert(ca *x509.Certificate, caPriv crypto.PrivateKey) (*x509.Cer
 		SerialNumber: big.NewInt(1),
 		DNSNames:     []string{"localhost"},
 		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1)},
-		NotBefore:    notBefore,
-		NotAfter:     notAfter,
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(24 * time.Hour),
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 	}
@@ -78,8 +72,8 @@ func GenerateTLSConfigWithLongCertChain(ca *x509.Certificate, caPrivateKey crypt
 	certTempl := &x509.Certificate{
 		SerialNumber:          big.NewInt(2019),
 		Subject:               pkix.Name{},
-		NotBefore:             notBefore,
-		NotAfter:              notAfter,
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
 		IsCA:                  true,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
