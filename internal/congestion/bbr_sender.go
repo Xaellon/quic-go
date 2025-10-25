@@ -276,9 +276,9 @@ func NewBbrSender(
 		bytesInFlight:                     bytesInFlight,
 	}
 	b.pacer = newPacer(func() Bandwidth {
-		bandwidth := Bandwidth(float64(b.bandwidthEstimate()) * b.congestionWindowGain)
+		bandwidth := Bandwidth(float64(b.bandwidthEstimate()) * b.pacingGain)
 		return Min(bandwidth, b.maxPacingRate)
-	})
+	}, 1.0)
 
 	// Switch to startup mode to probe for bandwidth.
 	b.enterStartupMode(b.clock.Now())
@@ -596,7 +596,7 @@ func (b *bbrSender) updateGainCyclePhase(now monotime.Time, priorInFlight protoc
 	// queue which could have been incurred by probing prior to it. If the number
 	// of bytes in flight falls down to the estimated BDP value earlier, conclude
 	// that the queue has been successfully drained and exit this cycle early.
-	if b.pacingGain < 1.0 && b.bytesInFlight() <= b.getTargetCongestionWindow(1) {
+	if b.pacingGain < 1.0 && b.bytesInFlight() <= b.getTargetCongestionWindow(1)*4/5 {
 		shouldAdvanceGainCycling = true
 	}
 
@@ -670,6 +670,8 @@ func (b *bbrSender) maybeExitStartupOrDrain(now monotime.Time) {
 	}
 
 	if b.mode == bbrModeDrain && b.bytesInFlight() <= b.getTargetCongestionWindow(1) {
+		b.roundsWithoutBandwidthGain = 0
+		b.bandwidthAtLastRound = b.maxBandwidth.GetBest()
 		b.enterProbeBandwidthMode(now)
 	}
 }

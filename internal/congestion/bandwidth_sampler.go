@@ -206,7 +206,7 @@ func (m *maxAckHeightTracker) Update(
 	// Compute how many extra bytes were delivered vs max bandwidth.
 	extraBytesAcked := m.aggregationEpochBytes - expectedBytesAcked
 	newEvent := extraAckedEvent{
-		extraAcked: expectedBytesAcked,
+		extraAcked: extraBytesAcked,
 		bytesAcked: m.aggregationEpochBytes,
 		timeDelta:  aggregationDelta,
 	}
@@ -679,11 +679,11 @@ func (b *bandwidthSampler) OnAcksEnd(
 	}
 
 	// Update max bandwidth and extra acknowledged bytes.
+	isNewMaxBandwidth := eventSample.sampleMaxBandwidth > maxBandwidth
 	maxBandwidth = Max(maxBandwidth, eventSample.sampleMaxBandwidth)
 	if b.limitMaxAckHeightTrackerBySendRate {
 		maxBandwidth = Max(maxBandwidth, maxSendRate)
 	}
-	isNewMaxBandwidth := eventSample.sampleMaxBandwidth > maxBandwidth
 	eventSample.extraAcked = b.extraAcked(
 		Min(maxBandwidth, limitBandwidth),
 		isNewMaxBandwidth,
