@@ -454,14 +454,16 @@ func (s *Server) handleConn(conn *quic.Conn) error {
 	b := make([]byte, 0, 64)
 	b = quicvarint.Append(b, streamTypeControlStream) // stream type
 	b = (&settingsFrame{
-		Datagram:        s.EnableDatagrams,
-		ExtendedConnect: true,
-		Other:           s.AdditionalSettings,
+		MaxFieldSectionSize: int64(s.maxHeaderBytes()),
+		Datagram:            s.EnableDatagrams,
+		ExtendedConnect:     true,
+		Other:               s.AdditionalSettings,
 	}).Append(b)
 	if qlogger != nil {
 		sf := qlog.SettingsFrame{
-			ExtendedConnect: pointer(true),
-			Other:           maps.Clone(s.AdditionalSettings),
+			MaxFieldSectionSize: int64(s.maxHeaderBytes()),
+			ExtendedConnect:     pointer(true),
+			Other:               maps.Clone(s.AdditionalSettings),
 		}
 		if s.EnableDatagrams {
 			sf.Datagram = pointer(true)
@@ -621,19 +623,23 @@ func (s *Server) handleRequest(
 		str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestIncomplete))
 		return
 	}
-	hfs, err := decoder.DecodeFull(headerBlock)
-	if err != nil {
-		// TODO: use the right error code
-		conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeGeneralProtocolError), "expected first frame to be a HEADERS frame")
-		return
+	decodeFn := decoder.Decode(headerBlock)
+	var hfs []qpack.HeaderField
+	if qlogger != nil {
+		hfs = make([]qpack.HeaderField, 0, 16)
 	}
+	req, err := requestFromHeaders(decodeFn, &hfs)
 	if qlogger != nil {
 		qlogParsedHeadersFrame(qlogger, str.StreamID(), hf, hfs)
 	}
-	req, err := requestFromHeaders(hfs)
 	if err != nil {
-		str.CancelRead(quic.StreamErrorCode(ErrCodeMessageError))
-		str.CancelWrite(quic.StreamErrorCode(ErrCodeMessageError))
+		errCode := ErrCodeMessageError
+		var qpackErr *qpackError
+		if errors.As(err, &qpackErr) {
+			errCode = ErrCodeQPACKDecompressionFailed
+		}
+		str.CancelRead(quic.StreamErrorCode(errCode))
+		str.CancelWrite(quic.StreamErrorCode(errCode))
 		return
 	}
 
