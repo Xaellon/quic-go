@@ -602,6 +602,10 @@ func (s *Server) handleRequest(
 		if !errors.Is(err, errHijacked) {
 			str.CancelRead(quic.StreamErrorCode(ErrCodeRequestIncomplete))
 			str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestIncomplete))
+		} else {
+			conn.streamMx.Lock()
+			delete(conn.streams, str.StreamID())
+			conn.streamMx.Unlock()
 		}
 		return
 	}
