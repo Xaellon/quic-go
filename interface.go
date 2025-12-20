@@ -191,8 +191,7 @@ type Config struct {
 	EnableStreamResetPartialDelivery bool
 	// MaxPacingRate is the maximum rate at which packets are sent, in bits per second (bps).
 	// It is used to limit the bandwidth used by a connection.
-	// This value must be set and cannot be zero.
-	// Values higher than the available network bandwidth may lead to unexpected results.
+	// If this value is set to 0, the default congestion control algorithm (CUBIC) is used.
 	MaxPacingRate uint64
 
 	Tracer func(ctx context.Context, isClient bool, connID ConnectionID) qlogwriter.Trace
