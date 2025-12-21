@@ -278,7 +278,7 @@ func NewBbrSender(
 	b.pacer = newPacer(func() Bandwidth {
 		bandwidth := Bandwidth(float64(b.bandwidthEstimate()) * b.pacingGain)
 		return Min(bandwidth, b.maxPacingRate)
-	}, 1.0)
+	})
 
 	// Switch to startup mode to probe for bandwidth.
 	b.enterStartupMode(b.clock.Now())

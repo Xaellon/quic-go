@@ -18,7 +18,7 @@ type pacer struct {
 	adjustedBandwidth func() uint64 // in bytes/s
 }
 
-func newPacer(getBandwidth func() Bandwidth, fudge float64) *pacer {
+func newPacer(getBandwidth func() Bandwidth) *pacer {
 	p := &pacer{
 		maxDatagramSize: initialMaxDatagramSize,
 		adjustedBandwidth: func() uint64 {
@@ -28,7 +28,7 @@ func newPacer(getBandwidth func() Bandwidth, fudge float64) *pacer {
 			// RTT variations then won't result in under-utilization of the congestion window.
 			// Ultimately, this will result in sending packets as acknowledgments are received rather than when timers fire,
 			// provided the congestion window is fully utilized and acknowledgments arrive at regular intervals.
-			return uint64(float64(bw) * fudge)
+			return bw * 11 / 10
 		},
 	}
 	p.budgetAtLastSent = p.maxBurstSize()
