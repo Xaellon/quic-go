@@ -405,14 +405,15 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	}
 
 	priorInFlight := h.bytesInFlight
-	ackedPackets, _, err := h.detectAndRemoveAckedPackets(ack, encLevel)
+	ackedPackets, hasAckEliciting, err := h.detectAndRemoveAckedPackets(ack, encLevel)
 	if err != nil || len(ackedPackets) == 0 {
 		return false, err
 	}
-	// Update the RTT only if the largest acked packet itself is ack-eliciting.
-	// RTT samples from non-ack-eliciting packets do not represent a full data round-trip.
+	// update the RTT, if:
+	// * the largest acked is newly acknowledged, AND
+	// * at least one new ack-eliciting packet was acknowledged
 	if len(ackedPackets) > 0 {
-		if p := ackedPackets[len(ackedPackets)-1]; p.PacketNumber == ack.LargestAcked() && !p.isPathProbePacket && p.IsAckEliciting() {
+		if p := ackedPackets[len(ackedPackets)-1]; p.PacketNumber == ack.LargestAcked() && !p.isPathProbePacket && hasAckEliciting {
 			// don't use the ack delay for Initial and Handshake packets
 			var ackDelay time.Duration
 			if encLevel == protocol.Encryption1RTT {
