@@ -249,12 +249,12 @@ func (h *sentPacketHandler) ReceivedPacket(l protocol.EncryptionLevel, t monotim
 }
 
 func (h *sentPacketHandler) packetsInFlight() int {
-	packetsInFlight := h.appDataPackets.history.Len()
+	packetsInFlight := h.appDataPackets.history.NumOutstanding()
 	if h.handshakePackets != nil {
-		packetsInFlight += h.handshakePackets.history.Len()
+		packetsInFlight += h.handshakePackets.history.NumOutstanding()
 	}
 	if h.initialPackets != nil {
-		packetsInFlight += h.initialPackets.history.Len()
+		packetsInFlight += h.initialPackets.history.NumOutstanding()
 	}
 	return packetsInFlight
 }
@@ -361,8 +361,9 @@ func (h *sentPacketHandler) qlogMetricsUpdated() {
 		h.lastMetrics.BytesInFlight = metricsUpdatedEvent.BytesInFlight
 		updated = true
 	}
-	if h.lastMetrics.PacketsInFlight != h.packetsInFlight() {
-		metricsUpdatedEvent.PacketsInFlight = h.packetsInFlight()
+	packetsInFlight := h.packetsInFlight()
+	if h.lastMetrics.PacketsInFlight != packetsInFlight {
+		metricsUpdatedEvent.PacketsInFlight = packetsInFlight
 		h.lastMetrics.PacketsInFlight = metricsUpdatedEvent.PacketsInFlight
 		updated = true
 	}
@@ -446,7 +447,7 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	}
 	var acked1RTTPacket bool
 	for _, p := range ackedPackets {
-		if p.includedInBytesInFlight && !p.declaredLost {
+		if p.includedInBytesInFlight {
 			h.congestion.OnPacketAcked(p.PacketNumber, p.Length, priorInFlight, rcvTime)
 		}
 		if p.EncryptionLevel == protocol.Encryption1RTT {
@@ -1090,14 +1091,14 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 		if firstPacketSendTime.IsZero() {
 			firstPacketSendTime = p.SendTime
 		}
-		if !p.declaredLost && p.IsAckEliciting() {
+		if p.IsAckEliciting() {
 			h.queueFramesForRetransmission(p)
 		}
 	}
 	// All application data packets sent at this point are 0-RTT packets.
 	// In the case of a Retry, we can assume that the server dropped all of them.
 	for _, p := range h.appDataPackets.history.Packets() {
-		if !p.declaredLost && p.IsAckEliciting() {
+		if p.IsAckEliciting() {
 			h.queueFramesForRetransmission(p)
 		}
 	}
