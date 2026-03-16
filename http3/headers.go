@@ -225,16 +225,16 @@ func requestFromHeaders(decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *
 		} else {
 			u.Path = hdr.Path
 		}
-		u.Scheme = hdr.Scheme
-		u.Host = hdr.Authority
 		requestURI = hdr.Authority
 	} else {
 		u, err = url.ParseRequestURI(hdr.Path)
 		if err != nil {
-			return nil, fmt.Errorf("invalid content length: %w", err)
+			return nil, fmt.Errorf("invalid request URI: %w", err)
 		}
 		requestURI = hdr.Path
 	}
+	u.Scheme = hdr.Scheme
+	u.Host = hdr.Authority
 
 	req := &http.Request{
 		Method:        hdr.Method,

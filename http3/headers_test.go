@@ -37,8 +37,9 @@ func TestRequestHeaderParsing(t *testing.T) {
 
 func testRequestHeaderParsing(t *testing.T, path string) {
 	headers := []qpack.HeaderField{
+		{Name: ":scheme", Value: "https"},
 		{Name: ":path", Value: path},
-		{Name: ":authority", Value: "quic-go.net"},
+		{Name: ":authority", Value: "quic-go.net:443"},
 		{Name: ":method", Value: http.MethodGet},
 		{Name: "content-length", Value: "42"},
 	}
@@ -46,7 +47,7 @@ func testRequestHeaderParsing(t *testing.T, path string) {
 	require.NoError(t, err)
 	require.Equal(t, http.MethodGet, req.Method)
 	require.Equal(t, path, req.URL.Path)
-	require.Equal(t, "", req.URL.Host)
+	require.Equal(t, "quic-go.net:443", req.URL.Host)
 	require.Equal(t, "HTTP/3.0", req.Proto)
 	require.Equal(t, 3, req.ProtoMajor)
 	require.Zero(t, req.ProtoMinor)
@@ -54,8 +55,11 @@ func testRequestHeaderParsing(t *testing.T, path string) {
 	require.Equal(t, 1, len(req.Header))
 	require.Equal(t, "42", req.Header.Get("Content-Length"))
 	require.Nil(t, req.Body)
-	require.Equal(t, "quic-go.net", req.Host)
+	require.Equal(t, "quic-go.net:443", req.Host)
 	require.Equal(t, path, req.RequestURI)
+	require.Equal(t, "quic-go.net", req.URL.Hostname())
+	require.Equal(t, "https", req.URL.Scheme)
+	require.Equal(t, "443", req.URL.Port())
 }
 
 func TestRequestHeadersContentLength(t *testing.T) {
@@ -121,9 +125,10 @@ func TestRequestHeadersContentLengthValidation(t *testing.T) {
 
 func TestRequestHeadersValidation(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		headers []qpack.HeaderField
-		err     string
+		name        string
+		headers     []qpack.HeaderField
+		err         string
+		errContains string
 	}{
 		{
 			name: "upper-case field name",
@@ -227,10 +232,24 @@ func TestRequestHeadersValidation(t *testing.T) {
 			},
 			err: ":protocol must be empty",
 		},
+		{
+			name: "invalid :path",
+			headers: []qpack.HeaderField{
+				{Name: ":path", Value: "invalid path"},
+				{Name: ":authority", Value: "quic-go.net"},
+				{Name: ":method", Value: http.MethodGet},
+			},
+			errContains: "invalid request URI",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := requestFromHeaders(decodeFromSlice(tc.headers), math.MaxInt, nil)
-			require.EqualError(t, err, tc.err)
+			if tc.errContains != "" {
+				require.ErrorContains(t, err, tc.errContains)
+			}
+			if tc.err != "" {
+				require.EqualError(t, err, tc.err)
+			}
 			require.NotErrorAs(t, err, new(*qpackError))
 		})
 	}
