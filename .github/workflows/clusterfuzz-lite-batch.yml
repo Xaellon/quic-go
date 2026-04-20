@@ -1,16 +1,12 @@
-name: ClusterFuzzLite PR fuzzing
+name: ClusterFuzzLite batch fuzzing
 on:
-  pull_request:
-    paths:
-      - '**'
-
+  schedule:
+    - cron: '0 0/6 * * *'
 permissions: read-all
+
 jobs:
-  PR:
-    runs-on: ${{ fromJSON(vars['CLUSTERFUZZ_LITE_RUNNER_UBUNTU'] || '"ubuntu-latest"') }}
-    concurrency:
-      group: ${{ github.workflow }}-${{ matrix.sanitizer }}-${{ github.ref }}
-      cancel-in-progress: true
+  BatchFuzzing:
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -22,21 +18,16 @@ jobs:
       uses: google/clusterfuzzlite/actions/build_fuzzers@v1
       with:
         language: go
-        github-token: ${{ secrets.GITHUB_TOKEN }}
         sanitizer: ${{ matrix.sanitizer }}
-        storage-repo: https://${{ secrets.CLUSTERFUZZ_LITE_STORAGE }}@github.com/quic-go/clusterfuzzlite-storage.git
-        storage-repo-branch: master
-        storage-repo-branch-coverage: gh-pages
     - name: Run Fuzzers (${{ matrix.sanitizer }})
       id: run
       uses: google/clusterfuzzlite/actions/run_fuzzers@v1
       with:
         github-token: ${{ secrets.GITHUB_TOKEN }}
-        fuzz-seconds: 480
-        mode: 'code-change'
+        fuzz-seconds: 3600
+        mode: 'batch'
         sanitizer: ${{ matrix.sanitizer }}
         output-sarif: true
-        parallel-fuzzing: true
         storage-repo: https://${{ secrets.CLUSTERFUZZ_LITE_STORAGE }}@github.com/quic-go/clusterfuzzlite-storage.git
         storage-repo-branch: master
         storage-repo-branch-coverage: gh-pages
