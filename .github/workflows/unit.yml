@@ -45,14 +45,15 @@ jobs:
           TIMESCALE_FACTOR: 20
         run: go test -v -shuffle on ./...
       - name: Run handshake tests in FIPS140 mode
+        if: ${{ matrix.go == '1.26.x' }}
         env:
           GODEBUG: fips140=only
-        run: go test -v ./internal/handshake -run TestToken
+        run: go test -v ./internal/handshake -run 'TestToken|TestRetry|TestInitial'
       - name: Run benchmark tests
         run: go test -v -run=^$ -benchtime 0.5s -bench=. ./...
       - name: Upload coverage to Codecov
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
         env:
           OS: ${{ matrix.os }}
           GO: ${{ matrix.go }}
@@ -62,7 +63,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
       - name: Upload test report to Codecov
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
         env:
           OS: ${{ matrix.os }}
           GO: ${{ matrix.go }}

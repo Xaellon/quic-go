@@ -851,7 +851,7 @@ func FuzzFrames(f *testing.F) {
 	} {
 		b, err := s.frame.Append(nil, version)
 		require.NoError(f, err)
-		corpus.Add(uint8(s.encLevel), uint16(0xffff), b)
+		corpus.Add(uint8(s.encLevel), uint16(protocol.MaxPacketBufferSize), b)
 	}
 
 	for _, fr := range []Frame{
@@ -903,7 +903,7 @@ func FuzzFrames(f *testing.F) {
 	} {
 		b, err := fr.Append(nil, version)
 		require.NoError(f, err)
-		maxSize := uint16(0xffff)
+		maxSize := uint16(protocol.MaxPacketBufferSize)
 		switch fr.(type) {
 		case *StreamFrame, *DatagramFrame:
 			maxSize = 256
@@ -916,6 +916,12 @@ func FuzzFrames(f *testing.F) {
 	f.Fuzz(func(t *testing.T, encLevelRaw uint8, maxSize uint16, data []byte) {
 		encLevel := protocol.EncryptionLevel(encLevelRaw)
 		if encLevel != protocol.EncryptionInitial && encLevel != protocol.EncryptionHandshake && encLevel != protocol.Encryption1RTT && encLevel != protocol.Encryption0RTT {
+			return
+		}
+		// maxSize is used to split off frames from the original frame (in the case of CRYPTO and STREAM frames),
+		// and to truncate ACK frames.
+		// This happens at the packet boundary, so values larger than the packet size are not interesting.
+		if maxSize > 10_000 {
 			return
 		}
 
