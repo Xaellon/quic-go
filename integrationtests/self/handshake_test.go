@@ -2,6 +2,7 @@ package self_test
 
 import (
 	"context"
+	"crypto/fips140"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -121,6 +122,10 @@ func TestHandshakeCipherSuites(t *testing.T) {
 		tls.TLS_CHACHA20_POLY1305_SHA256,
 	} {
 		t.Run(tls.CipherSuiteName(suiteID), func(t *testing.T) {
+			if fips140.Enabled() && suiteID == tls.TLS_CHACHA20_POLY1305_SHA256 {
+				t.Skip("ChaCha20-Poly1305 is not allowed in FIPS 140-3 mode")
+			}
+
 			reset := qtls.SetCipherSuite(suiteID)
 			defer reset()
 
@@ -281,7 +286,7 @@ func TestClosedConnectionsInAcceptQueue(t *testing.T) {
 
 	// accept all connections, and find the closed one
 	var closedConn *quic.Conn
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		conn, err := server.Accept(ctx)
 		require.NoError(t, err)
 		if conn.Context().Err() != nil {
@@ -308,7 +313,7 @@ func TestServerAcceptQueueOverflow(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	// fill up the accept queue
-	for i := 0; i < protocol.MaxAcceptQueueSize; i++ {
+	for range protocol.MaxAcceptQueueSize {
 		conn, err := dialer.Dial(ctx, server.Addr(), getTLSClientConfig(), getQuicConfig(nil))
 		require.NoError(t, err)
 		defer conn.CloseWithError(0, "")
