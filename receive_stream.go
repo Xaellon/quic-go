@@ -1,13 +1,13 @@
 package quic
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go/internal/ackhandler"
-	"github.com/quic-go/quic-go/internal/flowcontrol"
 	"github.com/quic-go/quic-go/internal/monotime"
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/qerr"
@@ -22,8 +22,9 @@ type ReceiveStream struct {
 
 	sender streamSender
 
-	frameQueue  *frameSorter
-	finalOffset protocol.ByteCount
+	frameQueue    *frameSorter
+	finalOffset   protocol.ByteCount
+	finalSizeChan chan struct{} // closed when the final size is known
 
 	currentFrame       []byte
 	currentFrameDone   func()
@@ -49,7 +50,7 @@ type ReceiveStream struct {
 	readOnce chan struct{} // cap: 1, to protect against concurrent use of Read
 	deadline monotime.Time
 
-	flowController flowcontrol.StreamFlowController
+	flowController *streamFlowController
 }
 
 var (
@@ -60,7 +61,7 @@ var (
 func newReceiveStream(
 	streamID protocol.StreamID,
 	sender streamSender,
-	flowController flowcontrol.StreamFlowController,
+	flowController *streamFlowController,
 ) *ReceiveStream {
 	return &ReceiveStream{
 		streamID:       streamID,
@@ -70,12 +71,39 @@ func newReceiveStream(
 		readChan:       make(chan struct{}, 1),
 		readOnce:       make(chan struct{}, 1),
 		finalOffset:    protocol.MaxByteCount,
+		finalSizeChan:  make(chan struct{}),
 	}
 }
 
 // StreamID returns the stream ID.
-func (s *ReceiveStream) StreamID() protocol.StreamID {
+func (s *ReceiveStream) StreamID() StreamID {
 	return s.streamID
+}
+
+// WaitForReceiveFinalSize waits until the receive stream's final size is known.
+// The final size is learned from a FIN or RESET_STREAM frame.
+// Most applications don't need this. It is mainly useful for protocol layers
+// that need exact stream final sizes, such as WebTransport flow control accounting.
+func (s *ReceiveStream) WaitForReceiveFinalSize(ctx context.Context) (int64, error) {
+	for {
+		s.mutex.Lock()
+		size := s.finalOffset
+		closeErr := s.closeForShutdownErr
+		finalSizeChan := s.finalSizeChan
+		s.mutex.Unlock()
+
+		if size != protocol.MaxByteCount {
+			return int64(size), nil
+		}
+		if closeErr != nil {
+			return 0, closeErr
+		}
+		select {
+		case <-finalSizeChan:
+		case <-ctx.Done():
+			return 0, context.Cause(ctx)
+		}
+	}
 }
 
 // Read reads data from the stream.
@@ -419,7 +447,7 @@ func (s *ReceiveStream) handleStreamFrameImpl(frame *wire.StreamFrame, now monot
 		return err
 	}
 	if frame.Fin {
-		s.finalOffset = maxOffset
+		s.setFinalOffset(maxOffset)
 	}
 	if s.cancelledLocally {
 		return nil
@@ -450,7 +478,7 @@ func (s *ReceiveStream) handleResetStreamFrameImpl(frame *wire.ResetStreamFrame,
 	if err := s.flowController.UpdateHighestReceived(frame.FinalSize, true, now); err != nil {
 		return err
 	}
-	s.finalOffset = frame.FinalSize
+	s.setFinalOffset(frame.FinalSize)
 
 	// senders are allowed to reduce the reliable size, but frames might have been reordered
 	if (!s.cancelledRemotely && s.reliableSize == 0) || frame.ReliableSize < s.reliableSize {
@@ -473,6 +501,11 @@ func (s *ReceiveStream) handleResetStreamFrameImpl(frame *wire.ResetStreamFrame,
 	s.cancelErr = &StreamError{StreamID: s.streamID, ErrorCode: frame.ErrorCode, Remote: true}
 	s.signalRead()
 	return nil
+}
+
+func (s *ReceiveStream) setFinalOffset(offset protocol.ByteCount) {
+	s.finalOffset = offset
+	s.closeFinalSizeChan()
 }
 
 func (s *ReceiveStream) getControlFrame(now monotime.Time) (_ ackhandler.Frame, ok, hasMore bool) {
@@ -515,8 +548,16 @@ func (s *ReceiveStream) SetReadDeadline(t time.Time) error {
 func (s *ReceiveStream) closeForShutdown(err error) {
 	s.mutex.Lock()
 	s.closeForShutdownErr = err
+	s.closeFinalSizeChan()
 	s.mutex.Unlock()
 	s.signalRead()
+}
+
+func (s *ReceiveStream) closeFinalSizeChan() {
+	if s.finalSizeChan != nil {
+		close(s.finalSizeChan)
+		s.finalSizeChan = nil
+	}
 }
 
 // signalRead performs a non-blocking send on the readChan

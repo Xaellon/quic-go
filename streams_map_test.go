@@ -6,8 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go/internal/flowcontrol"
-	"github.com/quic-go/quic-go/internal/mocks"
 	"github.com/quic-go/quic-go/internal/monotime"
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/qerr"
@@ -50,11 +48,7 @@ func testStreamsMapCreatingStreams(t *testing.T,
 		context.Background(),
 		mockSender,
 		func(wire.Frame) {},
-		func(protocol.StreamID) flowcontrol.StreamFlowController {
-			fc := mocks.NewMockStreamFlowController(mockCtrl)
-			fc.EXPECT().UpdateHighestReceived(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
-			return fc
-		},
+		newTestStreamFlowController,
 		1,
 		1,
 		perspective,
@@ -127,11 +121,7 @@ func testStreamsMapDeletingStreams(t *testing.T,
 		context.Background(),
 		mockSender,
 		func(frame wire.Frame) { frameQueue = append(frameQueue, frame) },
-		func(protocol.StreamID) flowcontrol.StreamFlowController {
-			fc := mocks.NewMockStreamFlowController(mockCtrl)
-			fc.EXPECT().UpdateHighestReceived(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
-			return fc
-		},
+		newTestStreamFlowController,
 		100,
 		100,
 		perspective,
@@ -214,11 +204,7 @@ func testStreamsMapStreamLimits(t *testing.T, perspective protocol.Perspective) 
 		context.Background(),
 		mockSender,
 		func(frame wire.Frame) { frameQueue = append(frameQueue, frame) },
-		func(protocol.StreamID) flowcontrol.StreamFlowController {
-			fc := mocks.NewMockStreamFlowController(mockCtrl)
-			fc.EXPECT().UpdateSendWindow(gomock.Any()).AnyTimes()
-			return fc
-		},
+		newTestStreamFlowController,
 		100,
 		100,
 		perspective,
@@ -308,12 +294,9 @@ func testStreamsMapHandleReceiveStreamFrames(t *testing.T, pers protocol.Perspec
 		context.Background(),
 		mockSender,
 		func(frame wire.Frame) {},
-		func(id protocol.StreamID) flowcontrol.StreamFlowController {
+		func(id protocol.StreamID) *streamFlowController {
 			streamsCreated = append(streamsCreated, id)
-			fc := mocks.NewMockStreamFlowController(mockCtrl)
-			fc.EXPECT().UpdateHighestReceived(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
-			fc.EXPECT().Abandon().AnyTimes()
-			return fc
+			return newTestStreamFlowController(id)
 		},
 		100,
 		100,
@@ -422,11 +405,9 @@ func testStreamsMapHandleSendStreamFrames(t *testing.T, pers protocol.Perspectiv
 		context.Background(),
 		mockSender,
 		func(frame wire.Frame) {},
-		func(id protocol.StreamID) flowcontrol.StreamFlowController {
+		func(id protocol.StreamID) *streamFlowController {
 			streamsCreated = append(streamsCreated, id)
-			fc := mocks.NewMockStreamFlowController(mockCtrl)
-			fc.EXPECT().UpdateSendWindow(gomock.Any()).AnyTimes()
-			return fc
+			return newTestStreamFlowController(id)
 		},
 		100,
 		100,
@@ -507,9 +488,7 @@ func TestStreamsMapClosing(t *testing.T) {
 		context.Background(),
 		mockSender,
 		func(wire.Frame) {},
-		func(protocol.StreamID) flowcontrol.StreamFlowController {
-			return mocks.NewMockStreamFlowController(mockCtrl)
-		},
+		newTestStreamFlowController,
 		1,
 		1,
 		protocol.PerspectiveClient,
@@ -528,16 +507,14 @@ func TestStreamsMapClosing(t *testing.T) {
 func TestStreamsMap0RTT(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	mockSender := NewMockStreamSender(mockCtrl)
-	fcBidi := mocks.NewMockStreamFlowController(mockCtrl)
-	fcUni := mocks.NewMockStreamFlowController(mockCtrl)
-	fcs := []flowcontrol.StreamFlowController{fcBidi, fcUni}
+	var fcs []*streamFlowController
 	m := newStreamsMap(
 		context.Background(),
 		mockSender,
 		func(wire.Frame) {},
-		func(protocol.StreamID) flowcontrol.StreamFlowController {
-			fc := fcs[0]
-			fcs = fcs[1:]
+		func(id protocol.StreamID) *streamFlowController {
+			fc := newTestStreamFlowController(id)
+			fcs = append(fcs, fc)
 			return fc
 		},
 		1,
@@ -554,8 +531,6 @@ func TestStreamsMap0RTT(t *testing.T) {
 	_, err = m.OpenUniStream()
 	require.NoError(t, err)
 
-	fcBidi.EXPECT().UpdateSendWindow(protocol.ByteCount(1234))
-	fcUni.EXPECT().UpdateSendWindow(protocol.ByteCount(4321))
 	// new transport parameters
 	m.HandleTransportParameters(&wire.TransportParameters{
 		MaxBidiStreamNum:               1000,
@@ -563,6 +538,39 @@ func TestStreamsMap0RTT(t *testing.T) {
 		MaxUniStreamNum:                1000,
 		InitialMaxStreamDataUni:        4321,
 	})
+	require.Len(t, fcs, 2)
+	require.Equal(t, protocol.ByteCount(1234), fcs[0].SendWindowSize())
+	require.Equal(t, protocol.ByteCount(4321), fcs[1].SendWindowSize())
+}
+
+func TestStreamsMap0RTTResetStreamAt(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled: %t", enabled), func(t *testing.T) {
+			mockSender := NewMockStreamSender(gomock.NewController(t))
+			mockSender.EXPECT().onHasStreamData(gomock.Any(), gomock.Any()).AnyTimes()
+			mockSender.EXPECT().onHasStreamControlFrame(gomock.Any(), gomock.Any()).AnyTimes()
+			m := newStreamsMap(
+				context.Background(),
+				mockSender,
+				func(wire.Frame) {},
+				func(id protocol.StreamID) *streamFlowController {
+					return newTestStreamFlowControllerWithSendWindow(id, 1)
+				},
+				1,
+				1,
+				protocol.PerspectiveClient,
+			)
+			m.HandleTransportParameters(&wire.TransportParameters{MaxBidiStreamNum: 1, MaxUniStreamNum: 1})
+			str, err := m.OpenStream()
+			require.NoError(t, err)
+			uniStr, err := m.OpenUniStream()
+			require.NoError(t, err)
+
+			m.HandleTransportParameters(&wire.TransportParameters{EnableResetStreamAt: enabled})
+			require.Equal(t, enabled, supportsResetStreamAt(t, str))
+			require.Equal(t, enabled, sendStreamSupportsResetStreamAt(t, uniStr))
+		})
+	}
 }
 
 func TestStreamsMap0RTTRejection(t *testing.T) {
@@ -572,11 +580,7 @@ func TestStreamsMap0RTTRejection(t *testing.T) {
 		context.Background(),
 		mockSender,
 		func(wire.Frame) {},
-		func(protocol.StreamID) flowcontrol.StreamFlowController {
-			fc := mocks.NewMockStreamFlowController(mockCtrl)
-			fc.EXPECT().UpdateHighestReceived(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
-			return fc
-		},
+		newTestStreamFlowController,
 		1,
 		1,
 		protocol.PerspectiveClient,
@@ -600,4 +604,71 @@ func TestStreamsMap0RTTRejection(t *testing.T) {
 	_, err = m.OpenStream()
 	require.Error(t, err)
 	require.ErrorIs(t, err, &StreamLimitReachedError{})
+}
+
+func TestStreamsMap0RTTRejectionResetStreamAt(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled: %t", enabled), func(t *testing.T) {
+			testStreamsMap0RTTRejectionResetStreamAt(t, enabled)
+		})
+	}
+}
+
+func testStreamsMap0RTTRejectionResetStreamAt(t *testing.T, enabled bool) {
+	mockSender := NewMockStreamSender(gomock.NewController(t))
+	mockSender.EXPECT().onHasStreamData(gomock.Any(), gomock.Any()).AnyTimes()
+	mockSender.EXPECT().onHasStreamControlFrame(gomock.Any(), gomock.Any()).AnyTimes()
+	m := newStreamsMap(
+		context.Background(),
+		mockSender,
+		func(wire.Frame) {},
+		func(id protocol.StreamID) *streamFlowController {
+			return newTestStreamFlowControllerWithSendWindow(id, 1)
+		},
+		2,
+		1,
+		protocol.PerspectiveClient,
+	)
+	m.HandleTransportParameters(&wire.TransportParameters{EnableResetStreamAt: true})
+	m.ResetFor0RTT()
+
+	// The server can send 0.5-RTT data before the handshake completes.
+	require.NoError(t, m.HandleStreamFrame(&wire.StreamFrame{StreamID: 1}, monotime.Now()))
+	m.UseResetMaps()
+
+	str, err := m.AcceptStream(context.Background())
+	require.NoError(t, err)
+	require.False(t, supportsResetStreamAt(t, str))
+
+	m.HandleTransportParameters(&wire.TransportParameters{EnableResetStreamAt: enabled})
+	require.NoError(t, m.HandleStreamFrame(&wire.StreamFrame{StreamID: 5}, monotime.Now()))
+	str, err = m.AcceptStream(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, enabled, supportsResetStreamAt(t, str))
+}
+
+func supportsResetStreamAt(t *testing.T, str *Stream) bool {
+	t.Helper()
+	_, err := str.Write([]byte{0})
+	require.NoError(t, err)
+	str.SetReliableBoundary()
+	str.CancelWrite(0)
+	frame, ok, _ := str.getControlFrame(monotime.Now())
+	require.True(t, ok)
+	reset, ok := frame.Frame.(*wire.ResetStreamFrame)
+	require.True(t, ok)
+	return reset.ReliableSize > 0
+}
+
+func sendStreamSupportsResetStreamAt(t *testing.T, str *SendStream) bool {
+	t.Helper()
+	_, err := str.Write([]byte{0})
+	require.NoError(t, err)
+	str.SetReliableBoundary()
+	str.CancelWrite(0)
+	frame, ok, _ := str.getControlFrame(monotime.Now())
+	require.True(t, ok)
+	reset, ok := frame.Frame.(*wire.ResetStreamFrame)
+	require.True(t, ok)
+	return reset.ReliableSize > 0
 }

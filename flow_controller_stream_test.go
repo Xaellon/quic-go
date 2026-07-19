@@ -1,4 +1,4 @@
-package flowcontrol
+package quic
 
 import (
 	"testing"
@@ -13,9 +13,9 @@ import (
 )
 
 func TestStreamFlowControlReceiving(t *testing.T) {
-	fc := NewStreamFlowController(
+	fc := newStreamFlowController(
 		42,
-		NewConnectionFlowController(
+		newConnectionFlowController(
 			protocol.MaxByteCount,
 			protocol.MaxByteCount,
 			nil,
@@ -45,10 +45,10 @@ func TestStreamFlowControlReceiving(t *testing.T) {
 }
 
 func TestStreamFlowControllerFinalOffset(t *testing.T) {
-	newFC := func() StreamFlowController {
-		return NewStreamFlowController(
+	newFC := func() *streamFlowController {
+		return newStreamFlowController(
 			42,
-			NewConnectionFlowController(
+			newConnectionFlowController(
 				protocol.MaxByteCount,
 				protocol.MaxByteCount,
 				nil,
@@ -105,7 +105,7 @@ func TestStreamFlowControllerFinalOffset(t *testing.T) {
 }
 
 func TestStreamAbandoning(t *testing.T) {
-	connFC := NewConnectionFlowController(
+	connFC := newConnectionFlowController(
 		100,
 		protocol.MaxByteCount,
 		nil,
@@ -113,7 +113,7 @@ func TestStreamAbandoning(t *testing.T) {
 		utils.DefaultLogger,
 	)
 	require.True(t, connFC.UpdateSendWindow(300))
-	fc := NewStreamFlowController(
+	fc := newStreamFlowController(
 		42,
 		connFC,
 		60,
@@ -136,7 +136,7 @@ func TestStreamAbandoning(t *testing.T) {
 func TestStreamSendWindow(t *testing.T) {
 	// We set up the connection flow controller with a limit of 300 bytes,
 	// and the stream flow controller with a limit of 100 bytes.
-	connFC := NewConnectionFlowController(
+	connFC := newConnectionFlowController(
 		protocol.MaxByteCount,
 		protocol.MaxByteCount,
 		nil,
@@ -144,7 +144,7 @@ func TestStreamSendWindow(t *testing.T) {
 		utils.DefaultLogger,
 	)
 	require.True(t, connFC.UpdateSendWindow(300))
-	fc := NewStreamFlowController(
+	fc := newStreamFlowController(
 		42,
 		connFC,
 		protocol.MaxByteCount,
@@ -155,10 +155,10 @@ func TestStreamSendWindow(t *testing.T) {
 	)
 	// first, we're limited by the stream flow controller
 	require.Equal(t, protocol.ByteCount(100), fc.SendWindowSize())
-	fc.AddBytesSent(50)
+	require.True(t, fc.TryAddBytesSent(50))
 	require.False(t, fc.IsNewlyBlocked())
 	require.Equal(t, protocol.ByteCount(50), fc.SendWindowSize())
-	fc.AddBytesSent(50)
+	require.True(t, fc.TryAddBytesSent(50))
 	require.True(t, fc.IsNewlyBlocked())
 	require.Zero(t, fc.SendWindowSize())
 	require.False(t, fc.IsNewlyBlocked()) // we're still blocked, but it's not new
@@ -171,15 +171,39 @@ func TestStreamSendWindow(t *testing.T) {
 
 	require.False(t, fc.IsNewlyBlocked()) // we're not blocked anymore
 	require.Equal(t, protocol.ByteCount(200), fc.SendWindowSize())
-	fc.AddBytesSent(200)
+	require.True(t, fc.TryAddBytesSent(200))
 	require.Zero(t, fc.SendWindowSize())
 	require.False(t, fc.IsNewlyBlocked()) // we're blocked, but not on stream flow control
 }
 
-func TestStreamWindowUpdate(t *testing.T) {
-	fc := NewStreamFlowController(
+func TestStreamFlowControllerTryAddBytesSent(t *testing.T) {
+	connFC := newConnectionFlowController(
+		protocol.MaxByteCount,
+		protocol.MaxByteCount,
+		nil,
+		utils.NewRTTStats(),
+		utils.DefaultLogger,
+	)
+	require.True(t, connFC.UpdateSendWindow(10))
+	fc := newStreamFlowController(
 		42,
-		NewConnectionFlowController(
+		connFC,
+		protocol.MaxByteCount,
+		protocol.MaxByteCount,
+		100,
+		utils.NewRTTStats(),
+		utils.DefaultLogger,
+	)
+
+	require.True(t, fc.TryAddBytesSent(6))
+	require.False(t, fc.TryAddBytesSent(5))
+	require.Equal(t, protocol.ByteCount(4), connFC.SendWindowSize())
+}
+
+func TestStreamWindowUpdate(t *testing.T) {
+	fc := newStreamFlowController(
+		42,
+		newConnectionFlowController(
 			protocol.MaxByteCount,
 			protocol.MaxByteCount,
 			nil,
@@ -217,14 +241,14 @@ func TestStreamWindowUpdate(t *testing.T) {
 }
 
 func TestStreamConnectionWindowUpdate(t *testing.T) {
-	connFC := NewConnectionFlowController(
+	connFC := newConnectionFlowController(
 		100,
 		protocol.MaxByteCount,
 		nil,
 		utils.NewRTTStats(),
 		utils.DefaultLogger,
 	)
-	fc := NewStreamFlowController(
+	fc := newStreamFlowController(
 		42,
 		connFC,
 		1000,
@@ -247,14 +271,14 @@ func TestStreamWindowAutoTuning(t *testing.T) {
 	rttStats.UpdateRTT(time.Second, 0)
 	require.Equal(t, time.Second, rttStats.SmoothedRTT())
 
-	connFC := NewConnectionFlowController(
+	connFC := newConnectionFlowController(
 		150, // initial receive window
 		350, // max receive window
 		func(size protocol.ByteCount) bool { return true },
 		rttStats,
 		utils.DefaultLogger,
 	)
-	fc := NewStreamFlowController(
+	fc := newStreamFlowController(
 		42,
 		connFC,
 		100, // initial send window

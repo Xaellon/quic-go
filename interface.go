@@ -58,6 +58,9 @@ type TokenStore interface {
 // when the server rejects a 0-RTT connection attempt.
 var Err0RTTRejected = errors.New("0-RTT rejected")
 
+// ErrWouldBlock is returned by [SendStream.TryWriteAll] if the entire slice can't be queued immediately.
+var ErrWouldBlock = errors.New("operation would block")
+
 // QUICVersionContextKey can be used to find out the QUIC version of a TLS handshake from the
 // context returned by tls.Config.ClientInfo.Context.
 var QUICVersionContextKey = handshake.QUICVersionContextKey
@@ -173,7 +176,7 @@ type Config struct {
 	// Enable QUIC datagram support (RFC 9221).
 	EnableDatagrams bool
 	// Enable QUIC Stream Resets with Partial Delivery.
-	// See https://datatracker.ietf.org/doc/html/draft-ietf-quic-reliable-stream-reset-07.
+	// See https://datatracker.ietf.org/doc/html/draft-ietf-quic-reliable-stream-reset-09.
 	EnableStreamResetPartialDelivery bool
 	// MaxPacingRate is the maximum rate at which packets are sent, in bits per second (bps).
 	// It is used to limit the bandwidth used by a connection.

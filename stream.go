@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go/internal/ackhandler"
-	"github.com/quic-go/quic-go/internal/flowcontrol"
 	"github.com/quic-go/quic-go/internal/monotime"
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/wire"
@@ -71,7 +70,7 @@ func newStream(
 	ctx context.Context,
 	streamID protocol.StreamID,
 	sender streamSender,
-	flowController flowcontrol.StreamFlowController,
+	flowController *streamFlowController,
 	supportsResetStreamAt bool,
 ) *Stream {
 	s := &Stream{sender: sender}
@@ -105,7 +104,7 @@ func newStream(
 }
 
 // StreamID returns the stream ID.
-func (s *Stream) StreamID() protocol.StreamID {
+func (s *Stream) StreamID() StreamID {
 	// the result is same for receiveStream and sendStream
 	return s.sendStr.StreamID()
 }
@@ -133,6 +132,12 @@ func (s *Stream) Write(p []byte) (int, error) {
 	return s.sendStr.Write(p)
 }
 
+// TryWriteAll writes data to the stream if it can be queued immediately.
+// See [SendStream.TryWriteAll] for more details.
+func (s *Stream) TryWriteAll(p []byte) error {
+	return s.sendStr.TryWriteAll(p)
+}
+
 // SetReliableBoundary marks the data written to this stream so far as reliable.
 // It is valid to call this function multiple times, thereby increasing the reliable size.
 // It only has an effect if the peer enabled support for the RESET_STREAM_AT extension,
@@ -151,6 +156,14 @@ func (s *Stream) CancelWrite(errorCode StreamErrorCode) {
 // See [ReceiveStream.CancelRead] for more details.
 func (s *Stream) CancelRead(errorCode StreamErrorCode) {
 	s.receiveStr.CancelRead(errorCode)
+}
+
+// WaitForReceiveFinalSize waits until the receive side's final size is known.
+// See [ReceiveStream.WaitForReceiveFinalSize] for more details.
+// Most applications don't need this. It is mainly useful for protocol layers
+// that need exact stream final sizes, such as WebTransport flow control accounting.
+func (s *Stream) WaitForReceiveFinalSize(ctx context.Context) (int64, error) {
+	return s.receiveStr.WaitForReceiveFinalSize(ctx)
 }
 
 // The Context is canceled as soon as the write-side of the stream is closed.

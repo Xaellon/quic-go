@@ -1,4 +1,4 @@
-package flowcontrol
+package quic
 
 import (
 	"fmt"
@@ -10,36 +10,38 @@ import (
 )
 
 type streamFlowController struct {
-	baseFlowController
+	receiveFlowController
+
+	bytesSent     protocol.ByteCount
+	sendWindow    protocol.ByteCount
+	lastBlockedAt protocol.ByteCount
 
 	streamID protocol.StreamID
 
-	connection connectionFlowControllerI
+	connection *connectionFlowController
 
 	receivedFinalOffset bool
 }
 
-var _ StreamFlowController = &streamFlowController{}
-
-// NewStreamFlowController gets a new flow controller for a stream
-func NewStreamFlowController(
+// newStreamFlowController gets a new flow controller for a stream.
+func newStreamFlowController(
 	streamID protocol.StreamID,
-	cfc ConnectionFlowController,
+	cfc *connectionFlowController,
 	receiveWindow protocol.ByteCount,
 	maxReceiveWindow protocol.ByteCount,
 	initialSendWindow protocol.ByteCount,
 	rttStats *utils.RTTStats,
 	logger utils.Logger,
-) StreamFlowController {
+) *streamFlowController {
 	return &streamFlowController{
 		streamID:   streamID,
-		connection: cfc.(connectionFlowControllerI),
-		baseFlowController: baseFlowController{
+		connection: cfc,
+		sendWindow: initialSendWindow,
+		receiveFlowController: receiveFlowController{
 			rttStats:             rttStats,
 			receiveWindow:        receiveWindow,
 			receiveWindowSize:    receiveWindow,
 			maxReceiveWindowSize: maxReceiveWindow,
-			sendWindow:           initialSendWindow,
 			logger:               logger,
 		},
 	}
@@ -117,18 +119,40 @@ func (c *streamFlowController) Abandon() {
 	}
 }
 
-func (c *streamFlowController) AddBytesSent(n protocol.ByteCount) {
-	c.baseFlowController.AddBytesSent(n)
-	c.connection.AddBytesSent(n)
+func (c *streamFlowController) UpdateSendWindow(offset protocol.ByteCount) (updated bool) {
+	if offset > c.sendWindow {
+		c.sendWindow = offset
+		return true
+	}
+	return false
+}
+
+func (c *streamFlowController) TryAddBytesSent(n protocol.ByteCount) bool {
+	if c.bytesSent > c.sendWindow || n > c.sendWindow-c.bytesSent {
+		return false
+	}
+	if !c.connection.TryAddBytesSent(n) {
+		return false
+	}
+	c.bytesSent += n
+	return true
 }
 
 func (c *streamFlowController) SendWindowSize() protocol.ByteCount {
-	return min(c.baseFlowController.SendWindowSize(), c.connection.SendWindowSize())
+	return min(c.sendWindow-c.bytesSent, c.connection.SendWindowSize())
 }
 
 func (c *streamFlowController) IsNewlyBlocked() bool {
-	blocked, _ := c.baseFlowController.IsNewlyBlocked()
+	blocked, _ := c.isNewlyBlocked()
 	return blocked
+}
+
+func (c *streamFlowController) isNewlyBlocked() (bool, protocol.ByteCount) {
+	if c.bytesSent < c.sendWindow || c.sendWindow == c.lastBlockedAt {
+		return false, 0
+	}
+	c.lastBlockedAt = c.sendWindow
+	return true, c.sendWindow
 }
 
 func (c *streamFlowController) shouldQueueWindowUpdate() bool {

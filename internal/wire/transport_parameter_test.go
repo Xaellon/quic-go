@@ -130,6 +130,30 @@ func TestMarshalAndUnmarshalTransportParameters(t *testing.T) {
 	require.Equal(t, minAckDelay, *p.MinAckDelay)
 }
 
+func TestResetStreamAtTransportParameterCodepoints(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ids  []transportParameterID
+	}{
+		{name: "current", ids: []transportParameterID{resetStreamAtParameterID}},
+		{name: "legacy", ids: []transportParameterID{legacyResetStreamAtParameterID}},
+		{name: "both", ids: []transportParameterID{resetStreamAtParameterID, legacyResetStreamAtParameterID}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var data []byte
+			for _, id := range tc.ids {
+				data = quicvarint.Append(data, uint64(id))
+				data = quicvarint.Append(data, 0)
+			}
+			data = appendInitialSourceConnectionID(data)
+
+			var p TransportParameters
+			require.NoError(t, p.Unmarshal(data, protocol.PerspectiveClient))
+			require.True(t, p.EnableResetStreamAt)
+		})
+	}
+}
+
 func TestMarshalAdditionalTransportParameters(t *testing.T) {
 	origAdditionalTransportParametersClient := AdditionalTransportParametersClient
 	t.Cleanup(func() {
@@ -394,6 +418,17 @@ func TestTransportParameterErrors(t *testing.T) {
 			expectedErrMsg: "wrong length for reset_stream_at: 1 (expected empty)",
 		},
 		{
+			name: "invalid value for legacy reset_stream_at",
+			data: func() []byte {
+				b := quicvarint.Append(nil, uint64(legacyResetStreamAtParameterID))
+				b = quicvarint.Append(b, 1)
+				b = quicvarint.Append(b, 1)
+				return appendInitialSourceConnectionID(b)
+			}(),
+			perspective:    protocol.PerspectiveClient,
+			expectedErrMsg: "wrong length for reset_stream_at: 1 (expected empty)",
+		},
+		{
 			name: "min ack delay is greater than max ack delay",
 			data: func() []byte {
 				b := quicvarint.Append(nil, uint64(minAckDelayParameterID))
@@ -460,6 +495,20 @@ func TestTransportParameterUnknownParameters(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, protocol.ByteCount(0x1337), p.InitialMaxStreamDataBidiLocal)
 	require.Equal(t, protocol.ByteCount(0x42), p.InitialMaxStreamDataBidiRemote)
+}
+
+func TestSessionTicketTransportParameterRejectsUnknownParameter(t *testing.T) {
+	b := (&TransportParameters{
+		ActiveConnectionIDLimit: 2,
+		MaxDatagramFrameSize:    protocol.InvalidByteCount,
+	}).MarshalForSessionTicket(nil)
+	b = quicvarint.Append(b, 0x42)
+	b = quicvarint.Append(b, 6)
+	b = append(b, []byte("foobar")...)
+
+	var p TransportParameters
+	err := p.UnmarshalFromSessionTicket(b)
+	require.EqualError(t, err, "unknown transport parameter 0x42 in session ticket")
 }
 
 func TestTransportParameterRejectsDuplicateParameters(t *testing.T) {
@@ -624,6 +673,16 @@ func TestSessionTicketInvalidTransportParameters(t *testing.T) {
 	require.Error(t, p.UnmarshalFromSessionTicket([]byte("foobar")))
 }
 
+func TestSessionTicketLegacyResetStreamAtTransportParameter(t *testing.T) {
+	b := quicvarint.Append(nil, transportParameterMarshalingVersion)
+	b = quicvarint.Append(b, uint64(legacyResetStreamAtParameterID))
+	b = quicvarint.Append(b, 0)
+
+	var p TransportParameters
+	require.NoError(t, p.UnmarshalFromSessionTicket(b))
+	require.True(t, p.EnableResetStreamAt)
+}
+
 func TestSessionTicketTransportParameterVersionMismatch(t *testing.T) {
 	var p TransportParameters
 	data := p.MarshalForSessionTicket(nil)
@@ -643,6 +702,7 @@ func TestTransportParametersValidFor0RTT(t *testing.T) {
 		MaxUniStreamNum:                6,
 		ActiveConnectionIDLimit:        7,
 		MaxDatagramFrameSize:           1000,
+		EnableResetStreamAt:            true,
 	}
 
 	tests := []struct {
@@ -654,6 +714,11 @@ func TestTransportParametersValidFor0RTT(t *testing.T) {
 			name:   "No Changes",
 			modify: func(p *TransportParameters) {},
 			valid:  true,
+		},
+		{
+			name:   "ResetStreamAt disabled",
+			modify: func(p *TransportParameters) { p.EnableResetStreamAt = false },
+			valid:  false,
 		},
 		{
 			name: "InitialMaxStreamDataBidiLocal reduced",
@@ -747,6 +812,12 @@ func TestTransportParametersValidFor0RTT(t *testing.T) {
 			require.Equal(t, tt.valid, p.ValidFor0RTT(saved))
 		})
 	}
+	t.Run("ResetStreamAt enabled", func(t *testing.T) {
+		p := *saved
+		withoutResetStreamAt := *saved
+		withoutResetStreamAt.EnableResetStreamAt = false
+		require.True(t, p.ValidFor0RTT(&withoutResetStreamAt))
+	})
 }
 
 func TestTransportParametersValidAfter0RTT(t *testing.T) {
@@ -759,6 +830,7 @@ func TestTransportParametersValidAfter0RTT(t *testing.T) {
 		MaxUniStreamNum:                6,
 		ActiveConnectionIDLimit:        7,
 		MaxDatagramFrameSize:           1000,
+		EnableResetStreamAt:            true,
 	}
 
 	tests := []struct {
@@ -770,6 +842,11 @@ func TestTransportParametersValidAfter0RTT(t *testing.T) {
 			name:   "no changes",
 			modify: func(p *TransportParameters) {},
 			reject: false,
+		},
+		{
+			name:   "ResetStreamAt disabled",
+			modify: func(p *TransportParameters) { p.EnableResetStreamAt = false },
+			reject: true,
 		},
 		{
 			name: "InitialMaxStreamDataBidiLocal reduced",
@@ -872,6 +949,12 @@ func TestTransportParametersValidAfter0RTT(t *testing.T) {
 			}
 		})
 	}
+	t.Run("ResetStreamAt enabled", func(t *testing.T) {
+		p := *saved
+		withoutResetStreamAt := *saved
+		withoutResetStreamAt.EnableResetStreamAt = false
+		require.True(t, p.ValidForUpdate(&withoutResetStreamAt))
+	})
 }
 
 func BenchmarkTransportParameters(b *testing.B) {
