@@ -3139,10 +3139,11 @@ func (c *Conn) NextConnection(ctx context.Context) (*Conn, error) {
 	case <-ctx.Done():
 		return nil, context.Cause(ctx)
 	case <-c.Context().Done():
+		return nil, context.Cause(c.Context())
 	case <-c.HandshakeComplete():
 		c.streamsMap.UseResetMaps()
+		return c, nil
 	}
-	return c, nil
 }
 
 // estimateMaxPayloadSize estimates the maximum payload size for short header packets.
