@@ -1,48 +1,44 @@
 package ringbuffer
 
-// A RingBuffer is a ring buffer.
-// It acts as a heap that doesn't cause any allocations.
+// RingBuffer is a growable FIFO queue that reuses its backing storage.
+// The slice length stores the queue length, so wrapped positions are accessed by reslicing to capacity.
 type RingBuffer[T any] struct {
-	ring             []T
-	headPos, tailPos int
-	full             bool
+	ring    []T // len is the number of queued elements; cap is the storage size
+	headPos int // index of the first element in the full backing storage
 }
 
 // Init preallocates a buffer with a certain size.
 func (r *RingBuffer[T]) Init(size int) {
-	r.ring = make([]T, size)
+	r.ring = make([]T, 0, size)
+	r.headPos = 0
 }
 
 // Len returns the number of elements in the ring buffer.
 func (r *RingBuffer[T]) Len() int {
-	if r.full {
-		return len(r.ring)
-	}
-	if r.tailPos >= r.headPos {
-		return r.tailPos - r.headPos
-	}
-	return r.tailPos - r.headPos + len(r.ring)
+	return len(r.ring)
 }
 
 // Empty says if the ring buffer is empty.
 func (r *RingBuffer[T]) Empty() bool {
-	return !r.full && r.headPos == r.tailPos
+	return len(r.ring) == 0
 }
 
 // PushBack adds a new element.
 // If the ring buffer is full, its capacity is increased first.
 func (r *RingBuffer[T]) PushBack(t T) {
-	if r.full || len(r.ring) == 0 {
+	if len(r.ring) == cap(r.ring) {
 		r.grow()
 	}
-	r.ring[r.tailPos] = t
-	r.tailPos++
-	if r.tailPos == len(r.ring) {
-		r.tailPos = 0
+	tailPos := r.headPos + len(r.ring)
+	if tailPos >= cap(r.ring) {
+		// both values in the sum are smaller than cap, so one subtraction wraps the index
+		tailPos -= cap(r.ring)
 	}
-	if r.tailPos == r.headPos {
-		r.full = true
-	}
+	// r.ring's length is the element count, so tailPos may be beyond it after a wrap.
+	// Grow the length before temporarily exposing the whole backing array; this order
+	// lets the compiler eliminate a bounds check.
+	r.ring = r.ring[:len(r.ring)+1]
+	r.ring[:cap(r.ring)][tailPos] = t
 }
 
 // PopFront returns the next element.
@@ -52,11 +48,13 @@ func (r *RingBuffer[T]) PopFront() T {
 	if r.Empty() {
 		panic("github.com/quic-go/quic-go/internal/utils/ringbuffer: pop from an empty queue")
 	}
-	r.full = false
-	t := r.ring[r.headPos]
-	r.ring[r.headPos] = *new(T)
+	// Shrink first. The backing storage remains accessible through cap,
+	// and this ordering avoids an extra bounds check.
+	r.ring = r.ring[:len(r.ring)-1]
+	t := r.ring[:cap(r.ring)][r.headPos]
+	clear(r.ring[:cap(r.ring)][r.headPos : r.headPos+1])
 	r.headPos++
-	if r.headPos == len(r.ring) {
+	if r.headPos == cap(r.ring) {
 		r.headPos = 0
 	}
 	return t
@@ -69,60 +67,61 @@ func (r *RingBuffer[T]) PeekFront() T {
 	if r.Empty() {
 		panic("github.com/quic-go/quic-go/internal/utils/ringbuffer: peek from an empty queue")
 	}
-	return r.ring[r.headPos]
+	return r.ring[:cap(r.ring)][r.headPos]
 }
 
-// Offset returns the offset element.
-// It must not be called when the buffer is empty, that means that
-// callers might need to check if there are elements in the buffer first
-// and check if the index larger than buffer length.
+// Offset returns a pointer to the element at the specified logical offset
+// from the front of the queue.
 func (r *RingBuffer[T]) Offset(index int) *T {
-	if r.Empty() || index >= r.Len() {
+	if index < 0 || index >= r.Len() {
 		panic("github.com/quic-go/quic-go/internal/utils/ringbuffer: offset from invalid index")
 	}
-	offset := (r.headPos + index) % len(r.ring)
-	return &r.ring[offset]
+
+	pos := r.headPos + index
+	if pos >= cap(r.ring) {
+		// r.headPos and index are both smaller than cap(r.ring),
+		// so one subtraction is enough to wrap the position.
+		pos -= cap(r.ring)
+	}
+
+	return &r.ring[:cap(r.ring)][pos]
 }
 
-// Front returns the front element.
-// It must not be called when the buffer is empty, that means that
-// callers might need to check if there are elements in the buffer first.
+// Front returns a pointer to the first element.
 func (r *RingBuffer[T]) Front() *T {
 	if r.Empty() {
 		panic("github.com/quic-go/quic-go/internal/utils/ringbuffer: front from an empty queue")
 	}
-	return &r.ring[r.headPos]
+
+	return &r.ring[:cap(r.ring)][r.headPos]
 }
 
-// Back returns the back element.
-// It must not be called when the buffer is empty, that means that
-// callers might need to check if there are elements in the buffer first.
+// Back returns a pointer to the last element.
 func (r *RingBuffer[T]) Back() *T {
 	if r.Empty() {
 		panic("github.com/quic-go/quic-go/internal/utils/ringbuffer: back from an empty queue")
 	}
+
 	return r.Offset(r.Len() - 1)
 }
 
-// Grow the maximum size of the queue.
-// This method assume the queue is full.
+// grow doubles the storage and copies the queued elements into FIFO order.
 func (r *RingBuffer[T]) grow() {
 	oldRing := r.ring
-	newSize := len(oldRing) * 2
+	newSize := cap(oldRing) * 2
 	if newSize == 0 {
 		newSize = 1
 	}
-	r.ring = make([]T, newSize)
-	headLen := copy(r.ring, oldRing[r.headPos:])
-	copy(r.ring[headLen:], oldRing[:r.headPos])
-	r.headPos, r.tailPos, r.full = 0, len(oldRing), false
+	newRing := make([]T, len(oldRing), newSize)
+	headLen := copy(newRing, oldRing[r.headPos:])
+	copy(newRing[headLen:], oldRing[:r.headPos])
+	r.ring = newRing
+	r.headPos = 0
 }
 
-// Clear removes all elements.
+// Clear removes all elements while retaining the allocated storage.
 func (r *RingBuffer[T]) Clear() {
-	var zeroValue T
-	for i := range r.ring {
-		r.ring[i] = zeroValue
-	}
-	r.headPos, r.tailPos, r.full = 0, 0, false
+	clear(r.ring[:cap(r.ring)])
+	r.ring = r.ring[:0]
+	r.headPos = 0
 }
