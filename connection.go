@@ -163,7 +163,7 @@ type Conn struct {
 	unpacker      unpacker
 	frameParser   wire.FrameParser
 	packer        packer
-	mtuDiscoverer mtuDiscoverer // initialized when the transport parameters are received
+	mtuDiscoverer *mtuFinder // initialized when the transport parameters are received
 
 	maxPayloadSizeEstimate atomic.Uint32
 
@@ -2314,7 +2314,8 @@ func (c *Conn) dropEncryptionLevel(encLevel protocol.EncryptionLevel, now monoti
 	case protocol.Encryption0RTT:
 		c.streamsMap.ResetFor0RTT()
 		c.framer.Handle0RTTRejection()
-		return c.connFlowController.Reset()
+		c.connFlowController.Reset()
+		return nil
 	}
 	return c.cryptoStreamManager.Drop(encLevel)
 }
@@ -3026,12 +3027,27 @@ func (c *Conn) onStreamCompleted(id protocol.StreamID) {
 	c.framer.RemoveActiveStream(id)
 }
 
+func (c *Conn) updateStreamPriority(id protocol.StreamID) {
+	c.framer.UpdateStreamPriority(id)
+	c.scheduleSending()
+}
+
+func (c *Conn) recordStreamPriorityUpdated(id protocol.StreamID, urgency int8, incremental bool) {
+	if c.qlogger != nil {
+		c.qlogger.RecordEvent(qlog.StreamPriorityUpdated{
+			StreamID:    id,
+			Urgency:     urgency,
+			Incremental: incremental,
+		})
+	}
+}
+
 // SendDatagram sends a message using a QUIC datagram, as specified in RFC 9221,
 // if the peer enabled datagram support.
 // There is no delivery guarantee for DATAGRAM frames, they are not retransmitted if lost.
 // The payload of the datagram needs to fit into a single QUIC packet.
 // In addition, a datagram may be dropped before being sent out if the available packet size suddenly decreases.
-// If the payload is too large to be sent at the current time, a DatagramTooLargeError is returned.
+// If the payload is too large to be sent at the current time, a [DatagramTooLargeError] is returned.
 func (c *Conn) SendDatagram(p []byte) error {
 	if !c.supportsDatagrams() {
 		return errors.New("datagram support disabled")
