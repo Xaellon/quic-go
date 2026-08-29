@@ -292,8 +292,8 @@ func (h *cryptoSetup) handleEvent(ev tls.QUICEvent) (err error) {
 			ev.SessionState.EarlyData = allowEarlyData
 		}
 		return nil
-	case quicErrorEvent:
-		return extractQUICEventError(ev)
+	case tls.QUICErrorEvent:
+		return ev.Err
 	default:
 		// Unknown events should be ignored.
 		// crypto/tls will ensure that this is safe to do.
@@ -682,7 +682,7 @@ func (h *cryptoSetup) ConnectionState() ConnectionState {
 }
 
 func wrapError(err error) error {
-	if alertErr := tls.AlertError(0); errors.As(err, &alertErr) {
+	if alertErr, ok := errors.AsType[tls.AlertError](err); ok {
 		return qerr.NewLocalCryptoError(uint8(alertErr), err)
 	}
 	return &qerr.TransportError{ErrorCode: qerr.InternalError, ErrorMessage: err.Error()}

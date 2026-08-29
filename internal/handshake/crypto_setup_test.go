@@ -76,9 +76,9 @@ func TestErrorBeforeClientHelloGeneration(t *testing.T) {
 		protocol.Version1,
 	)
 
-	var terr *qerr.TransportError
 	err := cl.StartHandshake(context.Background())
-	require.True(t, errors.As(err, &terr))
+	terr, ok := errors.AsType[*qerr.TransportError](err)
+	require.True(t, ok)
 	require.Equal(t, uint64(0x100+0x50), uint64(terr.ErrorCode))
 	require.Contains(t, err.Error(), "tls: invalid NextProtos value")
 }
@@ -232,6 +232,11 @@ func TestHandshake(t *testing.T) {
 func TestHelloRetryRequest(t *testing.T) {
 	clientConf, serverConf := getTLSConfigs()
 	serverConf.CurvePreferences = []tls.CurveID{tls.CurveP384}
+	var helloRetryRequest bool
+	serverConf.GetCertificate = func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		helloRetryRequest = info.HelloRetryRequest
+		return nil, nil
+	}
 	_, _, clientErr, _, _, serverErr := handshakeWithTLSConf(
 		t,
 		clientConf, serverConf,
@@ -241,6 +246,7 @@ func TestHelloRetryRequest(t *testing.T) {
 	)
 	require.NoError(t, clientErr)
 	require.NoError(t, serverErr)
+	require.True(t, helloRetryRequest)
 }
 
 func TestWithClientAuth(t *testing.T) {
