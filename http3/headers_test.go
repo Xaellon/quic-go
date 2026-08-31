@@ -29,41 +29,57 @@ func decodeFromSlice(headers []qpack.HeaderField) qpack.DecodeFunc {
 }
 
 func TestRequestHeaderParsing(t *testing.T) {
-	t.Run("regular path", func(t *testing.T) {
-		testRequestHeaderParsing(t, "/foo")
-	})
-
-	// see https://github.com/quic-go/quic-go/pull/1898
-	t.Run("path starting with //", func(t *testing.T) {
-		testRequestHeaderParsing(t, "//foo")
-	})
+	for _, tc := range []struct {
+		name   string
+		path   string
+		scheme string
+	}{
+		{name: "regular path", path: "/foo", scheme: "https"},
+		// see https://github.com/quic-go/quic-go/pull/1898
+		{name: "path starting with //", path: "//foo", scheme: "https"},
+		{name: "upper-case scheme", path: "/foo", scheme: "HTTPS"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			headers := []qpack.HeaderField{
+				{Name: ":scheme", Value: tc.scheme},
+				{Name: ":path", Value: tc.path},
+				{Name: ":authority", Value: "quic-go.net:443"},
+				{Name: ":method", Value: http.MethodGet},
+				{Name: "content-length", Value: "42"},
+			}
+			req, err := requestFromHeaders(decodeFromSlice(headers), math.MaxInt, nil)
+			require.NoError(t, err)
+			require.Equal(t, http.MethodGet, req.Method)
+			require.Equal(t, tc.path, req.URL.Path)
+			require.Equal(t, "quic-go.net:443", req.URL.Host)
+			require.Equal(t, "HTTP/3.0", req.Proto)
+			require.Equal(t, 3, req.ProtoMajor)
+			require.Zero(t, req.ProtoMinor)
+			require.Equal(t, int64(42), req.ContentLength)
+			require.Equal(t, 1, len(req.Header))
+			require.Equal(t, "42", req.Header.Get("Content-Length"))
+			require.Nil(t, req.Body)
+			require.Equal(t, "quic-go.net:443", req.Host)
+			require.Equal(t, tc.path, req.RequestURI)
+			require.Equal(t, "quic-go.net", req.URL.Hostname())
+			require.Equal(t, "https", req.URL.Scheme)
+			require.Equal(t, "443", req.URL.Port())
+		})
+	}
 }
 
-func testRequestHeaderParsing(t *testing.T, path string) {
+// TestRequestHeaderParsingWithHostHeader verifies that Host is used when :authority is omitted.
+func TestRequestHeaderParsingWithHostHeader(t *testing.T) {
 	headers := []qpack.HeaderField{
 		{Name: ":scheme", Value: "https"},
-		{Name: ":path", Value: path},
-		{Name: ":authority", Value: "quic-go.net:443"},
+		{Name: ":path", Value: "/"},
 		{Name: ":method", Value: http.MethodGet},
-		{Name: "content-length", Value: "42"},
+		{Name: "host", Value: "quic-go.net"},
 	}
 	req, err := requestFromHeaders(decodeFromSlice(headers), math.MaxInt, nil)
 	require.NoError(t, err)
-	require.Equal(t, http.MethodGet, req.Method)
-	require.Equal(t, path, req.URL.Path)
-	require.Equal(t, "quic-go.net:443", req.URL.Host)
-	require.Equal(t, "HTTP/3.0", req.Proto)
-	require.Equal(t, 3, req.ProtoMajor)
-	require.Zero(t, req.ProtoMinor)
-	require.Equal(t, int64(42), req.ContentLength)
-	require.Equal(t, 1, len(req.Header))
-	require.Equal(t, "42", req.Header.Get("Content-Length"))
-	require.Nil(t, req.Body)
-	require.Equal(t, "quic-go.net:443", req.Host)
-	require.Equal(t, path, req.RequestURI)
-	require.Equal(t, "quic-go.net", req.URL.Hostname())
-	require.Equal(t, "https", req.URL.Scheme)
-	require.Equal(t, "443", req.URL.Port())
+	require.Equal(t, "quic-go.net", req.Host)
+	require.Equal(t, "quic-go.net", req.URL.Host)
 }
 
 func TestRequestHeadersContentLength(t *testing.T) {
@@ -184,7 +200,7 @@ func TestRequestHeadersValidation(t *testing.T) {
 				{Name: ":authority", Value: "quic-go.net"},
 				{Name: ":method", Value: http.MethodGet},
 			},
-			err: ":path, :authority and :method must not be empty",
+			err: ":path and :authority must not be empty",
 		},
 		{
 			name: "missing :authority",
@@ -192,7 +208,7 @@ func TestRequestHeadersValidation(t *testing.T) {
 				{Name: ":path", Value: "/foo"},
 				{Name: ":method", Value: http.MethodGet},
 			},
-			err: ":path, :authority and :method must not be empty",
+			err: ":path and :authority must not be empty",
 		},
 		{
 			name: "missing :method",
@@ -200,12 +216,66 @@ func TestRequestHeadersValidation(t *testing.T) {
 				{Name: ":path", Value: "/foo"},
 				{Name: ":authority", Value: "quic-go.net"},
 			},
-			err: ":path, :authority and :method must not be empty",
+			err: ":method must not be empty",
+		},
+		{
+			name: "mismatching :authority and Host header field",
+			headers: []qpack.HeaderField{
+				{Name: ":scheme", Value: "https"},
+				{Name: ":path", Value: "/foo"},
+				{Name: ":authority", Value: "quic-go.net"},
+				{Name: ":method", Value: http.MethodGet},
+				{Name: "host", Value: "example.com"},
+			},
+			err: ":authority and Host header field values do not match",
+		},
+		{
+			name: "empty :authority and non-empty Host header field",
+			headers: []qpack.HeaderField{
+				{Name: ":scheme", Value: "https"},
+				{Name: ":path", Value: "/foo"},
+				{Name: ":authority", Value: ""},
+				{Name: ":method", Value: http.MethodGet},
+				{Name: "host", Value: "example.com"},
+			},
+			err: ":authority and Host header field values do not match",
+		},
+		{
+			name: "duplicate Host header field",
+			headers: []qpack.HeaderField{
+				{Name: ":scheme", Value: "https"},
+				{Name: ":path", Value: "/foo"},
+				{Name: ":method", Value: http.MethodGet},
+				{Name: "host", Value: "quic-go.net"},
+				{Name: "host", Value: "quic-go.net"},
+			},
+			err: "too many Host headers",
+		},
+		{
+			name: "Host header field with authority-less scheme",
+			headers: []qpack.HeaderField{
+				{Name: ":scheme", Value: "urn"},
+				{Name: ":path", Value: "/"},
+				{Name: ":method", Value: http.MethodGet},
+				{Name: "host", Value: "example.com"},
+			},
+			err: ":path and :authority must not be empty",
+		},
+		{
+			name: "invalid :method",
+			headers: []qpack.HeaderField{
+				{Name: ":scheme", Value: "https"},
+				{Name: ":path", Value: "/foo"},
+				{Name: ":authority", Value: "quic-go.net"},
+				// a method must be a token, and tokens cannot contain spaces
+				{Name: ":method", Value: "GET POST"},
+			},
+			err: `invalid :method: "GET POST"`,
 		},
 		{
 			name: "duplicate :path",
 			headers: []qpack.HeaderField{
-				{Name: ":path", Value: "/foo"},
+				{Name: ":path", Value: ""},
 				{Name: ":path", Value: "/foo"},
 			},
 			err: "duplicate pseudo header: :path",
@@ -213,7 +283,7 @@ func TestRequestHeadersValidation(t *testing.T) {
 		{
 			name: "duplicate :authority",
 			headers: []qpack.HeaderField{
-				{Name: ":authority", Value: "quic-go.net"},
+				{Name: ":authority", Value: ""},
 				{Name: ":authority", Value: "quic-go.net"},
 			},
 			err: "duplicate pseudo header: :authority",
@@ -221,11 +291,12 @@ func TestRequestHeadersValidation(t *testing.T) {
 		{
 			name: "duplicate :method",
 			headers: []qpack.HeaderField{
-				{Name: ":method", Value: http.MethodGet},
+				{Name: ":method", Value: ""},
 				{Name: ":method", Value: http.MethodGet},
 			},
 			err: "duplicate pseudo header: :method",
 		},
+		// :protocol is only valid for Extended CONNECT
 		{
 			name: "invalid :protocol",
 			headers: []qpack.HeaderField{
@@ -234,7 +305,17 @@ func TestRequestHeadersValidation(t *testing.T) {
 				{Name: ":method", Value: http.MethodGet},
 				{Name: ":protocol", Value: "connect-udp"},
 			},
-			err: ":protocol must be empty",
+			err: ":protocol must be omitted",
+		},
+		{
+			name: "empty :protocol",
+			headers: []qpack.HeaderField{
+				{Name: ":path", Value: "/foo"},
+				{Name: ":authority", Value: "quic-go.net"},
+				{Name: ":method", Value: http.MethodGet},
+				{Name: ":protocol", Value: ""},
+			},
+			err: ":protocol must be omitted",
 		},
 		{
 			name: "invalid :path",
@@ -244,6 +325,16 @@ func TestRequestHeadersValidation(t *testing.T) {
 				{Name: ":method", Value: http.MethodGet},
 			},
 			errContains: "invalid request URI",
+		},
+		{
+			name: "userinfo in :authority",
+			headers: []qpack.HeaderField{
+				{Name: ":scheme", Value: "https"},
+				{Name: ":path", Value: "/foo"},
+				{Name: ":authority", Value: "user@quic-go.net"},
+				{Name: ":method", Value: http.MethodGet},
+			},
+			err: "userinfo is not allowed in :authority",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -293,17 +384,19 @@ func TestHeadersConcatenation(t *testing.T) {
 
 func TestRequestHeadersConnect(t *testing.T) {
 	headers := []qpack.HeaderField{
-		{Name: ":authority", Value: "quic-go.net"},
+		{Name: ":authority", Value: "quic-go.net:443"},
 		{Name: ":method", Value: http.MethodConnect},
 	}
 	req, err := requestFromHeaders(decodeFromSlice(headers), math.MaxInt, nil)
 	require.NoError(t, err)
 	require.Equal(t, http.MethodConnect, req.Method)
 	require.Equal(t, "HTTP/3.0", req.Proto)
-	require.Equal(t, "quic-go.net", req.RequestURI)
+	require.Equal(t, "quic-go.net:443", req.RequestURI)
 }
 
 func TestRequestHeadersConnectValidation(t *testing.T) {
+	// RFC 9114, Section 4.4: a CONNECT request must contain the :authority pseudo-header field,
+	// and must not contain the :scheme and :path pseudo-header fields.
 	for _, tc := range []struct {
 		name    string
 		headers []qpack.HeaderField
@@ -314,15 +407,43 @@ func TestRequestHeadersConnectValidation(t *testing.T) {
 			headers: []qpack.HeaderField{
 				{Name: ":method", Value: http.MethodConnect},
 			},
-			err: ":path must be empty and :authority must not be empty",
+			err: ":scheme and :path must be omitted and :authority must not be empty",
+		},
+		{
+			name: ":scheme set",
+			headers: []qpack.HeaderField{
+				{Name: ":scheme", Value: "https"},
+				{Name: ":authority", Value: "quic-go.net:443"},
+				{Name: ":method", Value: http.MethodConnect},
+			},
+			err: ":scheme and :path must be omitted and :authority must not be empty",
 		},
 		{
 			name: ":path set",
 			headers: []qpack.HeaderField{
 				{Name: ":path", Value: "/foo"},
+				{Name: ":authority", Value: "quic-go.net:443"},
 				{Name: ":method", Value: http.MethodConnect},
 			},
-			err: ":path must be empty and :authority must not be empty",
+			err: ":scheme and :path must be omitted and :authority must not be empty",
+		},
+		{
+			name: "empty :path",
+			headers: []qpack.HeaderField{
+				{Name: ":path", Value: ""},
+				{Name: ":authority", Value: "quic-go.net"},
+				{Name: ":method", Value: http.MethodConnect},
+			},
+			err: ":scheme and :path must be omitted and :authority must not be empty",
+		},
+		{
+			name: "empty :scheme",
+			headers: []qpack.HeaderField{
+				{Name: ":scheme", Value: ""},
+				{Name: ":authority", Value: "quic-go.net"},
+				{Name: ":method", Value: http.MethodConnect},
+			},
+			err: ":scheme and :path must be omitted and :authority must not be empty",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -346,6 +467,7 @@ func TestRequestHeadersExtendedConnect(t *testing.T) {
 	require.Equal(t, "webtransport", req.Proto)
 	require.Equal(t, "ftp://quic-go.net/foo?val=1337", req.URL.String())
 	require.Equal(t, "1337", req.URL.Query().Get("val"))
+	require.Empty(t, req.Header)
 }
 
 func TestRequestHeadersExtendedConnectRequestValidation(t *testing.T) {
@@ -420,7 +542,7 @@ func TestResponseHeaderParsingValidation(t *testing.T) {
 		{
 			name: "duplicate :status",
 			headers: []qpack.HeaderField{
-				{Name: ":status", Value: "200"},
+				{Name: ":status", Value: ""},
 				{Name: ":status", Value: "404"},
 			},
 			err: "duplicate pseudo header: :status",
@@ -612,27 +734,28 @@ func TestQpackError(t *testing.T) {
 	})
 }
 
+var benchmarkRequestHeaders = []qpack.HeaderField{
+	{Name: ":path", Value: "/api/v1/users/12345"},
+	{Name: ":authority", Value: "quic-go.net"},
+	{Name: ":method", Value: http.MethodPost},
+	{Name: "content-type", Value: "application/json"},
+	{Name: "content-length", Value: "1024"},
+	{Name: "user-agent", Value: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"},
+	{Name: "accept", Value: "application/json, text/plain, */*"},
+	{Name: "accept-encoding", Value: "gzip, deflate, br"},
+	{Name: "accept-language", Value: "en-US,en;q=0.9"},
+	{Name: "cache-control", Value: "no-cache"},
+	{Name: "cookie", Value: "session_id=abc123"},
+	{Name: "cookie", Value: "user_pref=dark_mode"},
+	{Name: "referer", Value: "https://quic-go.net/docs/http3/"},
+}
+
 func BenchmarkRequestFromHeaders(b *testing.B) {
 	b.ReportAllocs()
 
-	headers := []qpack.HeaderField{
-		{Name: ":path", Value: "/api/v1/users/12345"},
-		{Name: ":authority", Value: "quic-go.net"},
-		{Name: ":method", Value: http.MethodPost},
-		{Name: "content-type", Value: "application/json"},
-		{Name: "content-length", Value: "1024"},
-		{Name: "user-agent", Value: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"},
-		{Name: "accept", Value: "application/json, text/plain, */*"},
-		{Name: "accept-encoding", Value: "gzip, deflate, br"},
-		{Name: "accept-language", Value: "en-US,en;q=0.9"},
-		{Name: "cache-control", Value: "no-cache"},
-		{Name: "cookie", Value: "session_id=abc123"},
-		{Name: "cookie", Value: "user_pref=dark_mode"},
-		{Name: "referer", Value: "https://quic-go.net/docs/http3/"},
-	}
 	var buf bytes.Buffer
 	enc := qpack.NewEncoder(&buf)
-	for _, hf := range headers {
+	for _, hf := range benchmarkRequestHeaders {
 		require.NoError(b, enc.WriteField(hf))
 	}
 
@@ -640,6 +763,16 @@ func BenchmarkRequestFromHeaders(b *testing.B) {
 	for b.Loop() {
 		decodeFn := dec.Decode(buf.Bytes())
 		if _, err := requestFromHeaders(decodeFn, math.MaxInt, nil); err != nil {
+			b.Fatalf("failed to parse request: %v", err)
+		}
+	}
+}
+
+func BenchmarkRequestFromHeaderFields(b *testing.B) {
+	b.ReportAllocs()
+
+	for b.Loop() {
+		if _, err := requestFromHeaders(decodeFromSlice(benchmarkRequestHeaders), math.MaxInt, nil); err != nil {
 			b.Fatalf("failed to parse request: %v", err)
 		}
 	}

@@ -984,12 +984,8 @@ func (c *Conn) handleHandshakeConfirmed(now monotime.Time) error {
 	// On the client side, this should have happened when sending the first Handshake packet,
 	// but this is not guaranteed if the server misbehaves.
 	// See CVE-2025-59530 for more details.
-	if err := c.dropEncryptionLevel(protocol.EncryptionInitial, now); err != nil {
-		return err
-	}
-	if err := c.dropEncryptionLevel(protocol.EncryptionHandshake, now); err != nil {
-		return err
-	}
+	c.dropEncryptionLevel(protocol.EncryptionInitial, now)
+	c.dropEncryptionLevel(protocol.EncryptionHandshake, now)
 
 	c.handshakeConfirmed = true
 	c.cryptoStreamHandler.SetHandshakeConfirmed()
@@ -1699,9 +1695,7 @@ func (c *Conn) handleUnpackedLongHeaderPacket(
 		!c.droppedInitialKeys {
 		// On the server side, Initial keys are dropped as soon as the first Handshake packet is received.
 		// See Section 4.9.1 of RFC 9001.
-		if err := c.dropEncryptionLevel(protocol.EncryptionInitial, rcvTime); err != nil {
-			return err
-		}
+		c.dropEncryptionLevel(protocol.EncryptionInitial, rcvTime)
 	}
 
 	c.lastPacketReceivedTime = rcvTime
@@ -2029,12 +2023,21 @@ func (c *Conn) handleHandshakeEvents(now monotime.Time) error {
 		case handshake.EventRestoredTransportParameters:
 			c.restoreTransportParameters(ev.TransportParameters)
 			close(c.earlyConnReadyChan)
-		case handshake.EventReceivedReadKeys:
+		case handshake.EventReceived0RTTReadKeys,
+			handshake.EventReceivedHandshakeReadKeys,
+			handshake.EventReceived1RTTReadKeys:
+			//nolint:exhaustive // only Handshake and 1-RTT require finishing the previous CRYPTO stream
+			switch ev.Kind {
+			case handshake.EventReceivedHandshakeReadKeys:
+				err = c.cryptoStreamManager.Finish(protocol.EncryptionInitial)
+			case handshake.EventReceived1RTTReadKeys:
+				err = c.cryptoStreamManager.Finish(protocol.EncryptionHandshake)
+			}
 			// queue all previously undecryptable packets
 			c.undecryptablePacketsToProcess = append(c.undecryptablePacketsToProcess, c.undecryptablePackets...)
 			c.undecryptablePackets = nil
 		case handshake.EventDiscard0RTTKeys:
-			err = c.dropEncryptionLevel(protocol.Encryption0RTT, now)
+			c.dropEncryptionLevel(protocol.Encryption0RTT, now)
 		case handshake.EventWriteInitialData:
 			_, err = c.initialStream.Write(ev.Data)
 		case handshake.EventWriteHandshakeData:
@@ -2302,7 +2305,7 @@ func (c *Conn) handleCloseError(closeErr *closeError) {
 	c.connIDGenerator.ReplaceWithClosed(connClosePacket, 3*c.rttStats.PTO(false))
 }
 
-func (c *Conn) dropEncryptionLevel(encLevel protocol.EncryptionLevel, now monotime.Time) error {
+func (c *Conn) dropEncryptionLevel(encLevel protocol.EncryptionLevel, now monotime.Time) {
 	c.sentPacketHandler.DropPackets(encLevel, now)
 	c.receivedPacketHandler.DropPackets(encLevel)
 	//nolint:exhaustive // only Initial and 0-RTT need special treatment
@@ -2314,9 +2317,7 @@ func (c *Conn) dropEncryptionLevel(encLevel protocol.EncryptionLevel, now monoti
 		c.streamsMap.ResetFor0RTT()
 		c.framer.Handle0RTTRejection()
 		c.connFlowController.Reset()
-		return nil
 	}
-	return c.cryptoStreamManager.Drop(encLevel)
 }
 
 // is called for the client, when restoring transport parameters saved for 0-RTT
@@ -2814,9 +2815,7 @@ func (c *Conn) sendPackedCoalescedPacket(packet *coalescedPacket, ecn protocol.E
 			!c.droppedInitialKeys {
 			// On the client side, Initial keys are dropped as soon as the first Handshake packet is sent.
 			// See Section 4.9.1 of RFC 9001.
-			if err := c.dropEncryptionLevel(protocol.EncryptionInitial, now); err != nil {
-				return err
-			}
+			c.dropEncryptionLevel(protocol.EncryptionInitial, now)
 		}
 	}
 	if p := packet.shortHdrPacket; p != nil {
