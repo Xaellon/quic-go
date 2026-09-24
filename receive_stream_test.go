@@ -533,7 +533,7 @@ func TestReceiveStreamImmediateFINs(t *testing.T) {
 	// peeking returns the EOF
 	n, err := (&peekerWithTimeout{Peeker: str, Timeout: time.Second}).Peek(make([]byte, 4))
 	require.ErrorIs(t, err, io.EOF)
-	require.Equal(t, 0, n)
+	require.Zero(t, n)
 
 	// and so does reading
 	n, err = (&readerWithTimeout{Reader: str, Timeout: time.Second}).Read(make([]byte, 4))
@@ -905,7 +905,7 @@ func TestReceiveStreamReset(t *testing.T) {
 
 		// further calls to Read return the error
 		_, err = strWithTimeout.Read([]byte{0})
-		require.Equal(t, &StreamError{StreamID: 42, ErrorCode: 1234, Remote: true}, err)
+		require.ErrorIs(t, err, &StreamError{StreamID: 42, ErrorCode: 1234, Remote: true})
 
 		// further RESET_STREAM frames have no effect
 		require.NoError(t, str.handleResetStreamFrame(

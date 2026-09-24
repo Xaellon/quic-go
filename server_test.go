@@ -82,7 +82,10 @@ func newTestServer(t *testing.T, serverOpts *serverOpts) *testServer {
 		serverOpts.acceptEarly,
 	)
 	s.newConn = serverOpts.newConn
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() {
+		s.Close()
+		tr.Close()
+	})
 	return &testServer{s}
 }
 
@@ -204,12 +207,10 @@ func checkRetry(t *testing.T,
 
 func TestListen(t *testing.T) {
 	_, err := ListenAddr("localhost:0", nil, nil)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "quic: tls.Config not set")
+	require.ErrorContains(t, err, "quic: tls.Config not set")
 
 	_, err = Listen(nil, &tls.Config{}, &Config{Versions: []protocol.Version{0x1234}})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "invalid QUIC version: 0x1234")
+	require.ErrorContains(t, err, "invalid QUIC version: 0x1234")
 }
 
 func TestListenAddr(t *testing.T) {
