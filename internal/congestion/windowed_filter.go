@@ -2,129 +2,57 @@ package congestion
 
 import "cmp"
 
-type WindowedFilterValue interface {
-	any
+type filterEntry[T cmp.Ordered] struct {
+	sample T
+	round  roundTripCount
 }
 
-type WindowedFilterTime interface {
-	~int | ~int8 | ~int16 | ~int32 | ~int64 |
-		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr |
-		~float32 | ~float64
+type windowedFilter[T cmp.Ordered] struct {
+	windowLength roundTripCount
+	estimates    [3]filterEntry[T]
 }
 
-type WindowedFilter[V WindowedFilterValue, T WindowedFilterTime] struct {
-	windowLength T
-	estimates    []entry[V, T]
-	comparator   func(V, V) int
+func newWindowedFilter[T cmp.Ordered](length roundTripCount) *windowedFilter[T] {
+	return &windowedFilter[T]{windowLength: length}
 }
 
-type entry[V WindowedFilterValue, T WindowedFilterTime] struct {
-	sample V
-	time   T
-}
-
-func Max[T cmp.Ordered](a, b T) T {
-	if a < b {
-		return b
-	}
-	return a
-}
-
-func Min[T cmp.Ordered](a, b T) T {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func MaxFilter[O cmp.Ordered](a, b O) int {
-	if a > b {
-		return 1
-	} else if a < b {
-		return -1
-	}
-	return 0
-}
-
-func MinFilter[O cmp.Ordered](a, b O) int {
-	if a < b {
-		return 1
-	} else if a > b {
-		return -1
-	}
-	return 0
-}
-
-func NewWindowedFilter[V WindowedFilterValue, T WindowedFilterTime](windowLength T, comparator func(V, V) int) *WindowedFilter[V, T] {
-	return &WindowedFilter[V, T]{
-		windowLength: windowLength,
-		estimates:    make([]entry[V, T], 3),
-		comparator:   comparator,
-	}
-}
-
-func (f *WindowedFilter[V, T]) SetWindowLength(windowLength T) {
-	f.windowLength = windowLength
-}
-
-func (f *WindowedFilter[V, T]) GetBest() V {
+func (f *windowedFilter[T]) GetBest() T {
 	return f.estimates[0].sample
 }
 
-func (f *WindowedFilter[V, T]) GetSecondBest() V {
-	return f.estimates[1].sample
-}
-
-func (f *WindowedFilter[V, T]) GetThirdBest() V {
-	return f.estimates[2].sample
-}
-
-func (f *WindowedFilter[V, T]) Update(newSample V, newTime T) {
-	if f.comparator(f.estimates[0].sample, *new(V)) == 0 ||
-		f.comparator(newSample, f.estimates[0].sample) >= 0 ||
-		newTime-f.estimates[2].time > f.windowLength {
-		f.Reset(newSample, newTime)
+func (f *windowedFilter[T]) Update(sample T, round roundTripCount) {
+	var zero T
+	if f.estimates[0].sample == zero || sample >= f.estimates[0].sample || round-f.estimates[2].round > f.windowLength {
+		f.Reset(sample, round)
 		return
 	}
-
-	if f.comparator(newSample, f.estimates[1].sample) >= 0 {
-		f.estimates[1] = entry[V, T]{newSample, newTime}
+	if sample >= f.estimates[1].sample {
+		f.estimates[1] = filterEntry[T]{sample, round}
 		f.estimates[2] = f.estimates[1]
-	} else if f.comparator(newSample, f.estimates[2].sample) >= 0 {
-		f.estimates[2] = entry[V, T]{newSample, newTime}
+	} else if sample >= f.estimates[2].sample {
+		f.estimates[2] = filterEntry[T]{sample, round}
 	}
-
-	if newTime-f.estimates[0].time > f.windowLength {
+	if round-f.estimates[0].round > f.windowLength {
 		f.estimates[0] = f.estimates[1]
 		f.estimates[1] = f.estimates[2]
-		f.estimates[2] = entry[V, T]{newSample, newTime}
-
-		if newTime-f.estimates[0].time > f.windowLength {
+		f.estimates[2] = filterEntry[T]{sample, round}
+		if round-f.estimates[0].round > f.windowLength {
 			f.estimates[0] = f.estimates[1]
 			f.estimates[1] = f.estimates[2]
 		}
 		return
 	}
-
-	if f.comparator(f.estimates[1].sample, f.estimates[0].sample) == 0 &&
-		newTime-f.estimates[1].time > f.windowLength/4 {
-		f.estimates[1] = entry[V, T]{newSample, newTime}
+	if f.estimates[1].sample == f.estimates[0].sample && round-f.estimates[1].round > f.windowLength/4 {
+		f.estimates[1] = filterEntry[T]{sample, round}
 		f.estimates[2] = f.estimates[1]
 		return
 	}
-
-	if f.comparator(f.estimates[2].sample, f.estimates[1].sample) == 0 &&
-		newTime-f.estimates[2].time > f.windowLength/2 {
-		f.estimates[2] = entry[V, T]{newSample, newTime}
+	if f.estimates[2].sample == f.estimates[1].sample && round-f.estimates[2].round > f.windowLength/2 {
+		f.estimates[2] = filterEntry[T]{sample, round}
 	}
 }
 
-func (f *WindowedFilter[V, T]) Reset(newSample V, newTime T) {
-	f.estimates[2] = entry[V, T]{newSample, newTime}
-	f.estimates[1] = f.estimates[2]
-	f.estimates[0] = f.estimates[1]
-}
-
-func (f *WindowedFilter[V, T]) Clear() {
-	f.estimates = make([]entry[V, T], 3)
+func (f *windowedFilter[T]) Reset(sample T, round roundTripCount) {
+	value := filterEntry[T]{sample, round}
+	f.estimates = [3]filterEntry[T]{value, value, value}
 }

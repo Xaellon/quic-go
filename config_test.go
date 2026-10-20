@@ -50,17 +50,14 @@ func TestConfigValidation(t *testing.T) {
 	})
 
 	t.Run("initial packet size", func(t *testing.T) {
-		// not set
 		conf := &Config{InitialPacketSize: 0}
 		require.NoError(t, validateConfig(conf))
 		require.Zero(t, conf.InitialPacketSize)
 
-		// too small
 		conf = &Config{InitialPacketSize: 10}
 		require.NoError(t, validateConfig(conf))
 		require.Equal(t, uint16(1200), conf.InitialPacketSize)
 
-		// too large
 		conf = &Config{InitialPacketSize: protocol.MaxPacketBufferSize + 1}
 		require.NoError(t, validateConfig(conf))
 		require.Equal(t, uint16(protocol.MaxPacketBufferSize), conf.InitialPacketSize)
@@ -81,13 +78,12 @@ func configWithNonZeroNonFunctionFields(t *testing.T) *Config {
 	for i := 0; i < typ.NumField(); i++ {
 		f := v.Field(i)
 		if !f.CanSet() {
-			// unexported field; not cloned.
 			continue
 		}
 
 		switch fn := typ.Field(i).Name; fn {
 		case "GetConfigForClient", "RequireAddressValidation", "GetLogWriter", "AllowConnectionWindowIncrease", "Tracer":
-			// Can't compare functions.
+
 		case "Versions":
 			f.Set(reflect.ValueOf([]Version{1, 2, 3}))
 		case "ConnectionIDLength":
@@ -126,6 +122,8 @@ func configWithNonZeroNonFunctionFields(t *testing.T) *Config {
 			f.Set(reflect.ValueOf(true))
 		case "Allow0RTT":
 			f.Set(reflect.ValueOf(true))
+		case "MaxPacingRate":
+			f.Set(reflect.ValueOf(uint64(1_000_000)))
 		case "EnableStreamResetPartialDelivery":
 			f.Set(reflect.ValueOf(true))
 		default:
@@ -169,11 +167,9 @@ func TestConfigClone(t *testing.T) {
 }
 
 func TestConfigDefaultValues(t *testing.T) {
-	// if set, the values should be copied
 	c := configWithNonZeroNonFunctionFields(t)
 	require.Equal(t, c, populateConfig(c))
 
-	// if not set, some fields use default values
 	c = populateConfig(&Config{})
 	require.Equal(t, protocol.SupportedVersions, c.Versions)
 	require.Equal(t, protocol.DefaultHandshakeIdleTimeout, c.HandshakeIdleTimeout)
@@ -184,9 +180,10 @@ func TestConfigDefaultValues(t *testing.T) {
 	require.EqualValues(t, protocol.DefaultMaxReceiveConnectionFlowControlWindow, c.MaxConnectionReceiveWindow)
 	require.EqualValues(t, protocol.DefaultMaxIncomingStreams, c.MaxIncomingStreams)
 	require.EqualValues(t, protocol.DefaultMaxIncomingUniStreams, c.MaxIncomingUniStreams)
+	require.Zero(t, c.MaxPacingRate)
 	require.False(t, c.DisablePathMTUDiscovery)
 	require.Nil(t, c.GetConfigForClient)
-	// Keep zero to distinguish the default from an explicitly configured floor.
+
 	require.Zero(t, c.InitialPacketSize)
 	require.Equal(t, protocol.ByteCount(protocol.InitialPacketSize), c.initialPacketSize())
 }
