@@ -14,6 +14,7 @@ import (
 	"github.com/quic-go/quic-go/internal/utils"
 	"github.com/quic-go/quic-go/internal/wire"
 	"github.com/quic-go/quic-go/qlogwriter"
+	"github.com/quic-go/quic-go/qlogwriter/jsontext"
 
 	"github.com/stretchr/testify/require"
 )
@@ -27,7 +28,6 @@ func testEventEncoding(t *testing.T, ev qlogwriter.Event) (string, string) {
 			nopWriteCloser(&buf),
 			true,
 			protocol.ParseConnectionID([]byte{1, 2, 3, 4}),
-			[]string{EventSchema},
 		)
 		go tr.Run()
 		producer := tr.AddProducer()
@@ -62,6 +62,26 @@ func decode(t *testing.T, data string) (string, string) {
 	return result.Name, string(result.Data)
 }
 
+func TestRawInfo(t *testing.T) {
+	tests := []struct {
+		name     string
+		raw      RawInfo
+		expected string
+	}{
+		{"zero lengths", RawInfo{Length: 0, PayloadLength: 0}, `{"length":0,"payload_length":0}`},
+		{"only zero length", RawInfo{Length: 0, PayloadLength: OmitLength}, `{"length":0}`},
+		{"only zero payload length", RawInfo{Length: OmitLength, PayloadLength: 0}, `{"payload_length":0}`},
+		{"omitted lengths", RawInfo{Length: OmitLength, PayloadLength: OmitLength}, `{}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			require.NoError(t, tt.raw.encode(jsontext.NewEncoder(&buf)))
+			require.JSONEq(t, tt.expected, buf.String())
+		})
+	}
+}
+
 func TestStartedConnection(t *testing.T) {
 	var localInfo, remoteInfo PathEndpointInfo
 	localInfo.IPv4 = netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 168, 13, 37}), 42)
@@ -76,8 +96,8 @@ func TestStartedConnection(t *testing.T) {
 
 	require.Equal(t, "transport:connection_started", name)
 	require.JSONEq(t, `{
-		"local": {"ip_v4": "192.168.13.37", "port_v4": 42},
-		"remote": {"ip_v6": "2001:db8::1", "port_v6": 24}
+		"local": {"ip_v4": {"ip": "192.168.13.37", "port": 42}},
+		"remote": {"ip_v6": {"ip": "2001:db8::1", "port": 24}}
 	}`, ev)
 }
 
@@ -348,10 +368,10 @@ func testTransportParametersWithPreferredAddress(t *testing.T, hasIPv4, hasIPv6 
 	require.Equal(t, "transport:parameters_set", name)
 	var addresses string
 	if hasIPv4 {
-		addresses += `"ip_v4": "12.34.56.78", "port_v4": 123,`
+		addresses += `"ip_v4": {"ip": "12.34.56.78", "port": 123},`
 	}
 	if hasIPv6 {
-		addresses += `"ip_v6": "102:304:506:708:90a:b0c:d0e:f10", "port_v6": 456,`
+		addresses += `"ip_v6": {"ip": "102:304:506:708:90a:b0c:d0e:f10", "port": 456},`
 	}
 	require.JSONEq(t, fmt.Sprintf(`{
 		"initiator": "local",
@@ -476,7 +496,7 @@ func testPacketSent1RTT(t *testing.T, datagramPayloadChecksum DatagramPayloadChe
 			KeyPhaseBit:      KeyPhaseZero,
 			DestConnectionID: protocol.ParseConnectionID([]byte{1, 2, 3, 4}),
 		},
-		Raw: RawInfo{Length: 123},
+		Raw: RawInfo{Length: 123, PayloadLength: OmitLength},
 		Frames: []Frame{
 			{Frame: &AckFrame{AckRanges: []wire.AckRange{{Smallest: 1, Largest: 10}}}},
 			{Frame: &MaxDataFrame{MaximumData: 987}},
@@ -601,7 +621,7 @@ func TestPacketReceivedRetry(t *testing.T) {
 			DestConnectionID: protocol.ParseConnectionID([]byte{1, 2, 3, 4, 5, 6, 7, 8}),
 			Token:            &Token{Raw: []byte{0xde, 0xad, 0xbe, 0xef}},
 		},
-		Raw: RawInfo{Length: 123},
+		Raw: RawInfo{Length: 123, PayloadLength: OmitLength},
 	})
 
 	require.Equal(t, "transport:packet_received", name)
@@ -649,7 +669,7 @@ func TestPacketBuffered(t *testing.T) {
 			DestConnectionID: protocol.ParseConnectionID([]byte{1, 2, 3, 4, 5, 6, 7, 8}),
 			SrcConnectionID:  protocol.ParseConnectionID([]byte{4, 3, 2, 1}),
 		},
-		Raw:                     RawInfo{Length: 1337},
+		Raw:                     RawInfo{Length: 1337, PayloadLength: OmitLength},
 		DatagramPayloadChecksum: 42,
 	})
 
@@ -665,7 +685,7 @@ func TestPacketBuffered(t *testing.T) {
 func TestPacketDropped(t *testing.T) {
 	name, ev := testEventEncoding(t, &PacketDropped{
 		Header:                  PacketHeader{PacketType: PacketTypeRetry},
-		Raw:                     RawInfo{Length: 1337},
+		Raw:                     RawInfo{Length: 1337, PayloadLength: OmitLength},
 		DatagramPayloadChecksum: 42,
 		Trigger:                 PacketDropPayloadDecryptError,
 	})
@@ -682,7 +702,7 @@ func TestPacketDropped(t *testing.T) {
 func TestDatagramDropped(t *testing.T) {
 	name, ev := testEventEncoding(t, &DatagramDropped{
 		Direction: DirectionReceiving,
-		Raw:       RawInfo{Length: 1337},
+		Raw:       RawInfo{Length: 1337, PayloadLength: OmitLength},
 		Trigger:   "buffer_full",
 	})
 
@@ -895,7 +915,6 @@ func TestLossTimerUpdated(t *testing.T) {
 			nopWriteCloser(&buf),
 			true,
 			protocol.ParseConnectionID([]byte{1, 2, 3, 4}),
-			[]string{EventSchema},
 		)
 		go tr.Run()
 		producer := tr.AddProducer()

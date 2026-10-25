@@ -464,7 +464,7 @@ func (s *Server) NewRawServerConn(conn *quic.Conn) (*RawServerConn, error) {
 
 func (s *Server) newRawServerConn(conn *quic.Conn) (*RawServerConn, *quic.SendStream, qlogwriter.Recorder, error) {
 	var qlogger qlogwriter.Recorder
-	if qlogTrace := conn.QlogTrace(); qlogTrace != nil && qlogTrace.SupportsSchemas(qlog.EventSchema) {
+	if qlogTrace := conn.QlogTrace(); qlogTrace != nil {
 		qlogger = qlogTrace.AddProducer()
 	}
 	connCtx := conn.Context()
@@ -566,6 +566,7 @@ func (s *Server) handleConn(conn *quic.Conn) error {
 			if qlogger != nil {
 				qlogger.RecordEvent(qlog.FrameCreated{
 					StreamID: ctrlStr.StreamID(),
+					Raw:      qlog.RawInfo{Length: qlog.OmitLength, PayloadLength: qlog.OmitLength},
 					Frame:    qlog.Frame{Frame: qlog.GoAwayFrame{StreamID: nextStreamID}},
 				})
 			}

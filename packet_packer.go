@@ -39,8 +39,11 @@ type sealer interface {
 type payload struct {
 	streamFrames []ackhandler.StreamFrame
 	frames       []ackhandler.Frame
-	ack          *wire.AckFrame
-	length       protocol.ByteCount
+	// The number of DATAGRAM frames in frames.
+	// DATAGRAM frames are the last frames in frames.
+	numDatagramFrames int
+	ack               *wire.AckFrame
+	length            protocol.ByteCount
 }
 
 type longHeaderPacket struct {
@@ -108,7 +111,8 @@ type sealingManager interface {
 
 type frameSource interface {
 	HasData() bool
-	Append([]ackhandler.Frame, []ackhandler.StreamFrame, protocol.ByteCount, monotime.Time, protocol.Version) ([]ackhandler.Frame, []ackhandler.StreamFrame, protocol.ByteCount)
+	AppendControlFrames([]ackhandler.Frame, protocol.ByteCount, monotime.Time, protocol.Version) ([]ackhandler.Frame, protocol.ByteCount)
+	AppendStreamFrames([]ackhandler.Frame, []ackhandler.StreamFrame, protocol.ByteCount, protocol.Version) ([]ackhandler.Frame, []ackhandler.StreamFrame, protocol.ByteCount)
 }
 
 type ackFrameSource interface {
@@ -661,30 +665,10 @@ func (p *packetPacker) composeNextPacket(
 		}
 	}
 
-	if p.datagramQueue != nil {
-		if f := p.datagramQueue.Peek(); f != nil {
-			size := f.Length(v)
-			if size <= maxPayloadSize-pl.length {
-				pl.frames = append(pl.frames, ackhandler.Frame{Frame: f})
-				pl.length += size
-				p.datagramQueue.Pop()
-			} else if pl.ack == nil {
-
-				p.datagramQueue.Pop()
-				if p.qlogger != nil {
-					p.qlogger.RecordEvent(qlog.DatagramDropped{
-						Direction: qlog.DirectionSending,
-						Raw:       qlog.RawInfo{Length: len(f.Data)},
-						Trigger:   "too_large",
-					})
-				}
-			}
-
-		}
-	}
-
-	if pl.ack != nil && !hasData && !hasRetransmission {
-		return pl
+	if hasData {
+		var lengthAdded protocol.ByteCount
+		pl.frames, lengthAdded = p.framer.AppendControlFrames(pl.frames, maxPayloadSize-pl.length, now, v)
+		pl.length += lengthAdded
 	}
 
 	if hasRetransmission {
@@ -702,24 +686,73 @@ func (p *packetPacker) composeNextPacket(
 		}
 	}
 
+	var lastDatagram *wire.DatagramFrame
+	if p.datagramQueue != nil {
+		for {
+			f := p.datagramQueue.Peek()
+			if f == nil {
+				break
+			}
+			size := f.Length(v)
+			if size > maxPayloadSize-pl.length {
+				f.DataLenPresent = false
+				size = f.Length(v)
+			}
+			if size <= maxPayloadSize-pl.length {
+				p.datagramQueue.Pop()
+				pl.frames = append(pl.frames, ackhandler.Frame{Frame: f})
+				pl.numDatagramFrames++
+				pl.length += size
+				lastDatagram = f
+				if !f.DataLenPresent {
+					break
+				}
+			} else if pl.ack == nil && len(pl.frames) == 0 {
+				p.datagramQueue.Pop()
+				if p.qlogger != nil {
+					p.qlogger.RecordEvent(qlog.DatagramDropped{
+						Direction: qlog.DirectionSending,
+						Raw:       qlog.RawInfo{Length: len(f.Data), PayloadLength: qlog.OmitLength},
+						Trigger:   "too_large",
+					})
+				}
+			} else {
+				f.DataLenPresent = true
+				break
+			}
+		}
+	}
+
 	if hasData {
 		var lengthAdded protocol.ByteCount
 		startLen := len(pl.frames)
-		pl.frames, pl.streamFrames, lengthAdded = p.framer.Append(pl.frames, pl.streamFrames, maxPayloadSize-pl.length, now, v)
+		pl.frames, pl.streamFrames, lengthAdded = p.framer.AppendStreamFrames(pl.frames, pl.streamFrames, maxPayloadSize-pl.length, v)
 		pl.length += lengthAdded
-
-		for i := startLen; i < len(pl.frames); i++ {
-			if pl.frames[i].Handler != nil {
-				continue
-			}
-			switch pl.frames[i].Frame.(type) {
-			case *wire.PathChallengeFrame, *wire.PathResponseFrame:
-
-			default:
-
-				pl.frames[i].Handler = p.retransmissionQueue.AckHandler(protocol.Encryption1RTT)
+		if n := pl.numDatagramFrames; n > 0 {
+			for i := startLen; i < len(pl.frames); i++ {
+				f := pl.frames[i]
+				copy(pl.frames[i-n+1:i+1], pl.frames[i-n:i])
+				pl.frames[i-n] = f
 			}
 		}
+	}
+
+	for i := range pl.frames {
+		if pl.frames[i].Handler != nil {
+			continue
+		}
+		switch pl.frames[i].Frame.(type) {
+		case *wire.DatagramFrame:
+		case *wire.PathChallengeFrame, *wire.PathResponseFrame:
+		default:
+			pl.frames[i].Handler = p.retransmissionQueue.AckHandler(protocol.Encryption1RTT)
+		}
+	}
+
+	if lastDatagram != nil && len(pl.streamFrames) == 0 {
+		pl.length -= lastDatagram.Length(v)
+		lastDatagram.DataLenPresent = false
+		pl.length += lastDatagram.Length(v)
 	}
 	return pl
 }
@@ -979,9 +1012,14 @@ func (p *packetPacker) appendPacketPayload(raw []byte, pl payload, paddingLen pr
 		raw = append(raw, make([]byte, paddingLen)...)
 	}
 
-	if len(pl.frames) > 1 {
-		p.rand.Shuffle(len(pl.frames), func(i, j int) { pl.frames[i], pl.frames[j] = pl.frames[j], pl.frames[i] })
+	toShuffle := pl.frames[:len(pl.frames)-pl.numDatagramFrames]
+	if len(toShuffle) > 1 {
+		p.rand.Shuffle(
+			len(toShuffle),
+			func(i, j int) { toShuffle[i], toShuffle[j] = toShuffle[j], toShuffle[i] },
+		)
 	}
+
 	for _, f := range pl.frames {
 		var err error
 		raw, err = f.Frame.Append(raw, v)
