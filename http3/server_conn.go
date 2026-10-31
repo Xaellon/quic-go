@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -82,6 +81,8 @@ func (c *RawServerConn) CloseWithError(code quic.ApplicationErrorCode, msg strin
 // The stream can either be obtained by calling [quic.Conn.AcceptStream] on the underlying QUIC connection,
 // or (internally) by using the server's stream accept loop.
 func (c *RawServerConn) HandleRequestStream(str *quic.Stream) {
+	// HTTP/3 handles this stream, so the peer can replace it as soon as it completes.
+	str.ReleaseStreamCredit()
 	hstr := c.rawConn.TrackStream(str)
 	c.handleRequestStream(hstr)
 }
@@ -172,8 +173,7 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 	req.TLS = &connState
 	req.RemoteAddr = conn.RemoteAddr().String()
 
-	// Check that the client doesn't send more data in DATA frames than indicated by the Content-Length header (if set).
-	// See section 4.1.2 of RFC 9114.
+	// Enforce the Content-Length, if set (section 4.1.2 of RFC 9114).
 	contentLength := int64(-1)
 	if _, ok := req.Header["Content-Length"]; ok && req.ContentLength >= 0 {
 		contentLength = req.ContentLength
@@ -252,13 +252,13 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 		return
 	}
 
-	// response not written to the client yet, set Content-Length
-	if !r.headerWritten {
-		if _, haveCL := r.header["Content-Length"]; !haveCL {
-			r.header.Set("Content-Length", strconv.FormatInt(r.numWritten, 10))
-		}
+	// Abort the stream if the response is incomplete: flushing failed, or the handler returned
+	// after a write failed partway through a DATA frame, which would leave the frame truncated.
+	if err := r.Finish(); err != nil || hstr.hasUnfinishedFrame() {
+		str.CancelRead(quic.StreamErrorCode(ErrCodeRequestCanceled))
+		str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestCanceled))
+		return
 	}
-	r.Flush()
 	r.flushTrailers()
 
 	// If the EOF was read by the handler, CancelRead() is a no-op.
