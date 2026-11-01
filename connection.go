@@ -1007,7 +1007,7 @@ func (c *Conn) handleOnePacket(
 			if destConnID != lastConnID {
 				if c.qlogger != nil {
 					c.qlogger.RecordEvent(qlog.PacketDropped{
-						Header:                  qlog.PacketHeader{DestConnectionID: destConnID},
+						Header:                  qlog.PacketHeader{PacketNumber: protocol.InvalidPacketNumber, DestConnectionID: destConnID},
 						Raw:                     qlog.RawInfo{Length: len(data), PayloadLength: qlog.OmitLength},
 						DatagramPayloadChecksum: datagramPayloadChecksum,
 						Trigger:                 qlog.PacketDropUnknownConnectionID,
@@ -1024,7 +1024,7 @@ func (c *Conn) handleOnePacket(
 				if c.qlogger != nil {
 					if err == wire.ErrUnsupportedVersion {
 						c.qlogger.RecordEvent(qlog.PacketDropped{
-							Header:                  qlog.PacketHeader{Version: hdr.Version},
+							Header:                  qlog.PacketHeader{PacketNumber: protocol.InvalidPacketNumber, Version: hdr.Version},
 							Raw:                     qlog.RawInfo{Length: len(data), PayloadLength: qlog.OmitLength},
 							DatagramPayloadChecksum: datagramPayloadChecksum,
 							Trigger:                 qlog.PacketDropUnsupportedVersion,
@@ -1418,6 +1418,7 @@ func (c *Conn) handleRetryPacket(hdr *wire.Header, data []byte, rcvTime monotime
 		if c.qlogger != nil {
 			c.qlogger.RecordEvent(qlog.PacketDropped{
 				Header: qlog.PacketHeader{
+					PacketNumber:     protocol.InvalidPacketNumber,
 					PacketType:       qlog.PacketTypeRetry,
 					SrcConnectionID:  hdr.SrcConnectionID,
 					DestConnectionID: hdr.DestConnectionID,
@@ -1434,6 +1435,7 @@ func (c *Conn) handleRetryPacket(hdr *wire.Header, data []byte, rcvTime monotime
 		if c.qlogger != nil {
 			c.qlogger.RecordEvent(qlog.PacketDropped{
 				Header: qlog.PacketHeader{
+					PacketNumber:     protocol.InvalidPacketNumber,
 					PacketType:       qlog.PacketTypeRetry,
 					SrcConnectionID:  hdr.SrcConnectionID,
 					DestConnectionID: hdr.DestConnectionID,
@@ -1451,6 +1453,7 @@ func (c *Conn) handleRetryPacket(hdr *wire.Header, data []byte, rcvTime monotime
 		if c.qlogger != nil {
 			c.qlogger.RecordEvent(qlog.PacketDropped{
 				Header: qlog.PacketHeader{
+					PacketNumber:     protocol.InvalidPacketNumber,
 					PacketType:       qlog.PacketTypeRetry,
 					SrcConnectionID:  hdr.SrcConnectionID,
 					DestConnectionID: hdr.DestConnectionID,
@@ -1474,6 +1477,7 @@ func (c *Conn) handleRetryPacket(hdr *wire.Header, data []byte, rcvTime monotime
 		if c.qlogger != nil {
 			c.qlogger.RecordEvent(qlog.PacketDropped{
 				Header: qlog.PacketHeader{
+					PacketNumber:     protocol.InvalidPacketNumber,
 					PacketType:       qlog.PacketTypeRetry,
 					SrcConnectionID:  hdr.SrcConnectionID,
 					DestConnectionID: hdr.DestConnectionID,
@@ -1523,7 +1527,7 @@ func (c *Conn) handleVersionNegotiationPacket(p receivedPacket) error {
 		c.receivedFirstPacket || c.receivedRetry || c.versionNegotiated { // ignore version negotiation packets received after any other packet
 		if c.qlogger != nil {
 			c.qlogger.RecordEvent(qlog.PacketDropped{
-				Header:  qlog.PacketHeader{PacketType: qlog.PacketTypeVersionNegotiation},
+				Header:  qlog.PacketHeader{PacketNumber: protocol.InvalidPacketNumber, PacketType: qlog.PacketTypeVersionNegotiation},
 				Raw:     qlog.RawInfo{Length: int(p.Size()), PayloadLength: qlog.OmitLength},
 				Trigger: qlog.PacketDropUnexpectedPacket,
 			})
@@ -1535,7 +1539,7 @@ func (c *Conn) handleVersionNegotiationPacket(p receivedPacket) error {
 	if err != nil {
 		if c.qlogger != nil {
 			c.qlogger.RecordEvent(qlog.PacketDropped{
-				Header:  qlog.PacketHeader{PacketType: qlog.PacketTypeVersionNegotiation},
+				Header:  qlog.PacketHeader{PacketNumber: protocol.InvalidPacketNumber, PacketType: qlog.PacketTypeVersionNegotiation},
 				Raw:     qlog.RawInfo{Length: int(p.Size()), PayloadLength: qlog.OmitLength},
 				Trigger: qlog.PacketDropHeaderParseError,
 			})
@@ -1548,7 +1552,7 @@ func (c *Conn) handleVersionNegotiationPacket(p receivedPacket) error {
 	if !bytes.Equal(src, c.origDestConnID.Bytes()) {
 		if c.qlogger != nil {
 			c.qlogger.RecordEvent(qlog.PacketDropped{
-				Header:  qlog.PacketHeader{PacketType: qlog.PacketTypeVersionNegotiation},
+				Header:  qlog.PacketHeader{PacketNumber: protocol.InvalidPacketNumber, PacketType: qlog.PacketTypeVersionNegotiation},
 				Raw:     qlog.RawInfo{Length: int(p.Size()), PayloadLength: qlog.OmitLength},
 				Trigger: qlog.PacketDropUnexpectedSourceConnectionID,
 			})
@@ -1560,7 +1564,7 @@ func (c *Conn) handleVersionNegotiationPacket(p receivedPacket) error {
 	if slices.Contains(supportedVersions, c.version) {
 		if c.qlogger != nil {
 			c.qlogger.RecordEvent(qlog.PacketDropped{
-				Header:  qlog.PacketHeader{PacketType: qlog.PacketTypeVersionNegotiation},
+				Header:  qlog.PacketHeader{PacketNumber: protocol.InvalidPacketNumber, PacketType: qlog.PacketTypeVersionNegotiation},
 				Raw:     qlog.RawInfo{Length: int(p.Size()), PayloadLength: qlog.OmitLength},
 				Trigger: qlog.PacketDropUnexpectedVersion,
 			})
@@ -2232,7 +2236,7 @@ func (c *Conn) handleCloseError(closeErr *closeError) {
 
 	if c.qlogger != nil && !errors.As(e, &recreateErr) {
 		initiator := qlog.InitiatorLocal
-		if isRemoteClose {
+		if isRemoteClose || statelessResetErr != nil {
 			initiator = qlog.InitiatorRemote
 		}
 		c.qlogger.RecordEvent(qlog.ConnectionClosed{
@@ -2284,28 +2288,18 @@ func (c *Conn) restoreTransportParameters(params *wire.TransportParameters) {
 		c.logger.Debugf("Restoring Transport Parameters: %s", params)
 	}
 	if c.qlogger != nil {
+		// only log the parameters that are saved in the session ticket
 		c.qlogger.RecordEvent(qlog.ParametersSet{
-			Restore:                         true,
-			Initiator:                       qlog.InitiatorRemote,
-			SentBy:                          c.perspective,
-			OriginalDestinationConnectionID: params.OriginalDestinationConnectionID,
-			InitialSourceConnectionID:       params.InitialSourceConnectionID,
-			RetrySourceConnectionID:         params.RetrySourceConnectionID,
-			StatelessResetToken:             params.StatelessResetToken,
-			DisableActiveMigration:          params.DisableActiveMigration,
-			MaxIdleTimeout:                  params.MaxIdleTimeout,
-			MaxUDPPayloadSize:               params.MaxUDPPayloadSize,
-			AckDelayExponent:                params.AckDelayExponent,
-			MaxAckDelay:                     params.MaxAckDelay,
-			ActiveConnectionIDLimit:         params.ActiveConnectionIDLimit,
-			InitialMaxData:                  params.InitialMaxData,
-			InitialMaxStreamDataBidiLocal:   params.InitialMaxStreamDataBidiLocal,
-			InitialMaxStreamDataBidiRemote:  params.InitialMaxStreamDataBidiRemote,
-			InitialMaxStreamDataUni:         params.InitialMaxStreamDataUni,
-			InitialMaxStreamsBidi:           int64(params.MaxBidiStreamNum),
-			InitialMaxStreamsUni:            int64(params.MaxUniStreamNum),
-			MaxDatagramFrameSize:            params.MaxDatagramFrameSize,
-			EnableResetStreamAt:             params.EnableResetStreamAt,
+			Restore:                        true,
+			ActiveConnectionIDLimit:        params.ActiveConnectionIDLimit,
+			InitialMaxData:                 params.InitialMaxData,
+			InitialMaxStreamDataBidiLocal:  params.InitialMaxStreamDataBidiLocal,
+			InitialMaxStreamDataBidiRemote: params.InitialMaxStreamDataBidiRemote,
+			InitialMaxStreamDataUni:        params.InitialMaxStreamDataUni,
+			InitialMaxStreamsBidi:          int64(params.MaxBidiStreamNum),
+			InitialMaxStreamsUni:           int64(params.MaxUniStreamNum),
+			MaxDatagramFrameSize:           params.MaxDatagramFrameSize,
+			EnableResetStreamAt:            params.EnableResetStreamAt,
 		})
 	}
 

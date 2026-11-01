@@ -1,9 +1,11 @@
 package qlog
 
 import (
+	"encoding/hex"
 	"fmt"
 	"net/netip"
 	"time"
+	"unicode/utf8"
 
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/qerr"
@@ -81,20 +83,20 @@ func (p PathEndpointInfo) encode(enc *jsontext.Encoder, redacted *string) error 
 	h.WriteToken(jsontext.BeginObject)
 	if redacted != nil {
 		if p.IPv4.IsValid() {
-			h.WriteToken(jsontext.String("ip_v4"))
+			h.WriteToken(jsontext.String("address_v4"))
 		} else {
-			h.WriteToken(jsontext.String("ip_v6"))
+			h.WriteToken(jsontext.String("address_v6"))
 		}
 		h.WriteToken(jsontext.String(*redacted))
 		h.WriteToken(jsontext.EndObject)
 		return h.err
 	}
 	if p.IPv4.IsValid() {
-		h.WriteToken(jsontext.String("ip_v4"))
+		h.WriteToken(jsontext.String("address_v4"))
 		h.WriteIPAddressPort(p.IPv4)
 	}
 	if p.IPv6.IsValid() {
-		h.WriteToken(jsontext.String("ip_v6"))
+		h.WriteToken(jsontext.String("address_v6"))
 		h.WriteIPAddressPort(p.IPv6)
 	}
 	h.WriteToken(jsontext.EndObject)
@@ -272,7 +274,6 @@ type PacketSent struct {
 	DatagramPayloadChecksum DatagramPayloadChecksum
 	Frames                  []Frame
 	ECN                     ECN
-	IsCoalesced             bool
 	Trigger                 string
 	SupportedVersions       []Version
 	// Tuple is the TupleID of the network tuple that the packet was sent on.
@@ -303,10 +304,6 @@ func (e PacketSent) Encode(enc *jsontext.Encoder, _ time.Time) error {
 			return err
 		}
 	}
-	if e.IsCoalesced {
-		h.WriteToken(jsontext.String("is_coalesced"))
-		h.WriteToken(jsontext.True)
-	}
 	if e.ECN != ECNUnsupported {
 		h.WriteToken(jsontext.String("ecn"))
 		h.WriteToken(jsontext.String(string(e.ECN)))
@@ -329,7 +326,6 @@ type PacketReceived struct {
 	DatagramPayloadChecksum DatagramPayloadChecksum
 	Frames                  []Frame
 	ECN                     ECN
-	IsCoalesced             bool
 	Trigger                 string
 	// Tuple is the TupleID of the network tuple that the packet was received on.
 	// It is empty for the tuple that the TupleID "" is assigned to.
@@ -358,10 +354,6 @@ func (e PacketReceived) Encode(enc *jsontext.Encoder, _ time.Time) error {
 		if err := frames(e.Frames).encode(enc); err != nil {
 			return err
 		}
-	}
-	if e.IsCoalesced {
-		h.WriteToken(jsontext.String("is_coalesced"))
-		h.WriteToken(jsontext.True)
 	}
 	if e.ECN != ECNUnsupported {
 		h.WriteToken(jsontext.String("ecn"))
@@ -548,7 +540,7 @@ func (e MTUUpdated) Name() string { return "recovery:mtu_updated" }
 func (e MTUUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	h := encoderHelper{enc: enc}
 	h.WriteToken(jsontext.BeginObject)
-	h.WriteToken(jsontext.String("mtu"))
+	h.WriteToken(jsontext.String("new"))
 	h.WriteToken(jsontext.Uint(uint64(e.Value)))
 	h.WriteToken(jsontext.String("done"))
 	h.WriteToken(jsontext.Bool(e.Done))
@@ -558,7 +550,6 @@ func (e MTUUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
 
 // RecoveryParametersSet is the quic:recovery_parameters_set event.
 type RecoveryParametersSet struct {
-	EncryptionLevel         EncryptionLevel
 	ReorderingThreshold     uint16
 	PacketThresholdDisabled bool
 	TimeThreshold           float64 // RTT multiplier.
@@ -574,8 +565,6 @@ func (e RecoveryParametersSet) Name() string { return "quic:recovery_parameters_
 func (e RecoveryParametersSet) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	h := encoderHelper{enc: enc}
 	h.WriteToken(jsontext.BeginObject)
-	h.WriteToken(jsontext.String("packet_number_space"))
-	h.WriteToken(jsontext.String(encLevelToPacketNumberSpace(e.EncryptionLevel)))
 	h.WriteToken(jsontext.String("reordering_threshold"))
 	if e.PacketThresholdDisabled {
 		h.WriteToken(jsontext.String("disabled"))
@@ -598,7 +587,7 @@ func (e RecoveryParametersSet) Encode(enc *jsontext.Encoder, _ time.Time) error 
 	return h.err
 }
 
-// MetricsUpdated logs RTT and congestion metrics as defined in the
+// MetricsUpdated logs a snapshot of RTT and congestion metrics as defined in the
 // recovery:metrics_updated event.
 // The PTO count is logged via [PTOCountUpdated].
 type MetricsUpdated struct {
@@ -628,22 +617,16 @@ func (e MetricsUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
 		h.WriteToken(jsontext.String("latest_rtt"))
 		h.WriteToken(jsontext.Float(milliseconds(e.LatestRTT)))
 	}
-	if e.RTTVariance != 0 {
+	if e.RTTVariance != 0 || e.SmoothedRTT != 0 {
 		h.WriteToken(jsontext.String("rtt_variance"))
 		h.WriteToken(jsontext.Float(milliseconds(e.RTTVariance)))
 	}
-	if e.CongestionWindow != 0 {
-		h.WriteToken(jsontext.String("congestion_window"))
-		h.WriteToken(jsontext.Uint(uint64(e.CongestionWindow)))
-	}
-	if e.BytesInFlight != 0 {
-		h.WriteToken(jsontext.String("bytes_in_flight"))
-		h.WriteToken(jsontext.Uint(uint64(e.BytesInFlight)))
-	}
-	if e.PacketsInFlight != 0 {
-		h.WriteToken(jsontext.String("packets_in_flight"))
-		h.WriteToken(jsontext.Uint(uint64(e.PacketsInFlight)))
-	}
+	h.WriteToken(jsontext.String("congestion_window"))
+	h.WriteToken(jsontext.Uint(uint64(e.CongestionWindow)))
+	h.WriteToken(jsontext.String("bytes_in_flight"))
+	h.WriteToken(jsontext.Uint(uint64(e.BytesInFlight)))
+	h.WriteToken(jsontext.String("packets_in_flight"))
+	h.WriteToken(jsontext.Uint(uint64(e.PacketsInFlight)))
 	h.WriteToken(jsontext.EndObject)
 	return h.err
 }
@@ -799,36 +782,38 @@ func (e ParametersSet) Encode(enc *jsontext.Encoder, _ time.Time) error {
 		h.WriteToken(jsontext.String(string(e.Initiator)))
 		if e.SentBy == protocol.PerspectiveServer {
 			h.WriteToken(jsontext.String("original_destination_connection_id"))
-			h.WriteToken(jsontext.String(e.OriginalDestinationConnectionID.String()))
+			h.WriteToken(jsontext.String(fmt.Sprintf("%x", e.OriginalDestinationConnectionID.Bytes())))
 			if e.StatelessResetToken != nil {
 				h.WriteToken(jsontext.String("stateless_reset_token"))
 				h.WriteToken(jsontext.String(fmt.Sprintf("%x", e.StatelessResetToken[:])))
 			}
 			if e.RetrySourceConnectionID != nil {
 				h.WriteToken(jsontext.String("retry_source_connection_id"))
-				h.WriteToken(jsontext.String((*e.RetrySourceConnectionID).String()))
+				h.WriteToken(jsontext.String(fmt.Sprintf("%x", (*e.RetrySourceConnectionID).Bytes())))
 			}
 		}
 		h.WriteToken(jsontext.String("initial_source_connection_id"))
-		h.WriteToken(jsontext.String(e.InitialSourceConnectionID.String()))
+		h.WriteToken(jsontext.String(fmt.Sprintf("%x", e.InitialSourceConnectionID.Bytes())))
+		// disable_active_migration is not restored for 0-RTT
+		h.WriteToken(jsontext.String("disable_active_migration"))
+		h.WriteToken(jsontext.Bool(e.DisableActiveMigration))
 	}
-	h.WriteToken(jsontext.String("disable_active_migration"))
-	h.WriteToken(jsontext.Bool(e.DisableActiveMigration))
 	if e.MaxIdleTimeout != 0 {
 		h.WriteToken(jsontext.String("max_idle_timeout"))
-		h.WriteToken(jsontext.Float(milliseconds(e.MaxIdleTimeout)))
+		h.WriteToken(jsontext.Uint(uint64(e.MaxIdleTimeout.Milliseconds())))
 	}
 	if e.MaxUDPPayloadSize != 0 {
 		h.WriteToken(jsontext.String("max_udp_payload_size"))
 		h.WriteToken(jsontext.Int(int64(e.MaxUDPPayloadSize)))
 	}
-	if e.AckDelayExponent != 0 {
+	// The ack_delay_exponent is not restored for 0-RTT.
+	if !e.Restore {
 		h.WriteToken(jsontext.String("ack_delay_exponent"))
 		h.WriteToken(jsontext.Uint(uint64(e.AckDelayExponent)))
 	}
 	if e.MaxAckDelay != 0 {
 		h.WriteToken(jsontext.String("max_ack_delay"))
-		h.WriteToken(jsontext.Float(milliseconds(e.MaxAckDelay)))
+		h.WriteToken(jsontext.Uint(uint64(e.MaxAckDelay.Milliseconds())))
 	}
 	if e.ActiveConnectionIDLimit != 0 {
 		h.WriteToken(jsontext.String("active_connection_id_limit"))
@@ -889,21 +874,21 @@ func (a PreferredAddress) encode(enc *jsontext.Encoder) error {
 	h := encoderHelper{enc: enc}
 	h.WriteToken(jsontext.BeginObject)
 	if a.RedactedIPv4 != nil {
-		h.WriteToken(jsontext.String("ip_v4"))
+		h.WriteToken(jsontext.String("address_v4"))
 		h.WriteToken(jsontext.String(*a.RedactedIPv4))
 	} else if a.IPv4.IsValid() {
-		h.WriteToken(jsontext.String("ip_v4"))
+		h.WriteToken(jsontext.String("address_v4"))
 		h.WriteIPAddressPort(a.IPv4)
 	}
 	if a.RedactedIPv6 != nil {
-		h.WriteToken(jsontext.String("ip_v6"))
+		h.WriteToken(jsontext.String("address_v6"))
 		h.WriteToken(jsontext.String(*a.RedactedIPv6))
 	} else if a.IPv6.IsValid() {
-		h.WriteToken(jsontext.String("ip_v6"))
+		h.WriteToken(jsontext.String("address_v6"))
 		h.WriteIPAddressPort(a.IPv6)
 	}
 	h.WriteToken(jsontext.String("connection_id"))
-	h.WriteToken(jsontext.String(a.ConnectionID.String()))
+	h.WriteToken(jsontext.String(fmt.Sprintf("%x", a.ConnectionID.Bytes())))
 	h.WriteToken(jsontext.String("stateless_reset_token"))
 	h.WriteToken(jsontext.String(fmt.Sprintf("%x", a.StatelessResetToken)))
 	h.WriteToken(jsontext.EndObject)
@@ -924,27 +909,18 @@ func (e LossTimerUpdated) Encode(enc *jsontext.Encoder, t time.Time) error {
 	h.WriteToken(jsontext.BeginObject)
 	h.WriteToken(jsontext.String("event_type"))
 	h.WriteToken(jsontext.String(string(e.Type)))
-	h.WriteToken(jsontext.String("timer_type"))
-	h.WriteToken(jsontext.String(string(e.TimerType)))
-	h.WriteToken(jsontext.String("packet_number_space"))
-	h.WriteToken(jsontext.String(encLevelToPacketNumberSpace(e.EncLevel)))
+	if e.TimerType != "" {
+		h.WriteToken(jsontext.String("timer_type"))
+		h.WriteToken(jsontext.String(string(e.TimerType)))
+	}
+	if e.EncLevel != 0 {
+		h.WriteToken(jsontext.String("packet_number_space"))
+		h.WriteToken(jsontext.String(encLevelToPacketNumberSpace(e.EncLevel)))
+	}
 	if e.Type == LossTimerUpdateTypeSet {
 		h.WriteToken(jsontext.String("delta"))
 		h.WriteToken(jsontext.Float(milliseconds(e.Time.Sub(t))))
 	}
-	h.WriteToken(jsontext.EndObject)
-	return h.err
-}
-
-type eventLossTimerCanceled struct{}
-
-func (e eventLossTimerCanceled) Name() string { return "recovery:loss_timer_updated" }
-
-func (e eventLossTimerCanceled) Encode(enc *jsontext.Encoder, _ time.Time) error {
-	h := encoderHelper{enc: enc}
-	h.WriteToken(jsontext.BeginObject)
-	h.WriteToken(jsontext.String("event_type"))
-	h.WriteToken(jsontext.String("cancelled"))
 	h.WriteToken(jsontext.EndObject)
 	return h.err
 }
@@ -994,7 +970,15 @@ func (e ALPNInformation) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	h := encoderHelper{enc: enc}
 	h.WriteToken(jsontext.BeginObject)
 	h.WriteToken(jsontext.String("chosen_alpn"))
-	h.WriteToken(jsontext.String(e.ChosenALPN))
+	h.WriteToken(jsontext.BeginObject)
+	if utf8.ValidString(e.ChosenALPN) {
+		h.WriteToken(jsontext.String("string_value"))
+		h.WriteToken(jsontext.String(e.ChosenALPN))
+	} else {
+		h.WriteToken(jsontext.String("byte_value"))
+		h.WriteToken(jsontext.String(hex.EncodeToString([]byte(e.ChosenALPN))))
+	}
+	h.WriteToken(jsontext.EndObject)
 	h.WriteToken(jsontext.EndObject)
 	return h.err
 }

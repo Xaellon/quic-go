@@ -296,6 +296,17 @@ func TestSentPacketHandlerRTTAckEliciting(t *testing.T) {
 	require.Equal(t, 800*time.Millisecond, rttStats.LatestRTT())
 	require.Zero(t, getPacketsInFlight())
 	require.Zero(t, getBytesInFlight())
+
+	sph.MigratedPath(now, 1200)
+	eventRecorder.Clear()
+	sendPacket(t, now, 1200, true)
+	metrics := eventRecorder.Events(qlog.MetricsUpdated{})
+	require.Len(t, metrics, 1)
+	require.Equal(t, qlog.MetricsUpdated{
+		CongestionWindow: 32 * 1200,
+		BytesInFlight:    1200,
+		PacketsInFlight:  1,
+	}, metrics[0])
 }
 
 func TestSentPacketHandlerRTTAcrossPacketNumberSpaces(t *testing.T) {
@@ -783,7 +794,6 @@ func TestSentPacketHandlerAdaptiveTimeThreshold(t *testing.T) {
 		utils.DefaultLogger,
 	)
 	parameters := qlog.RecoveryParametersSet{
-		EncryptionLevel:         protocol.Encryption1RTT,
 		ReorderingThreshold:     packetThreshold,
 		TimeThreshold:           1.125,
 		TimerGranularity:        protocol.TimerGranularity,
@@ -1927,7 +1937,6 @@ func TestSentPacketHandlerSpuriousLoss(t *testing.T) {
 		eventRecorder.Events(qlog.SpuriousLoss{}),
 	)
 	parameters := qlog.RecoveryParametersSet{
-		EncryptionLevel:         protocol.Encryption1RTT,
 		ReorderingThreshold:     packetThreshold,
 		PacketThresholdDisabled: true,
 		TimeThreshold:           1.125,

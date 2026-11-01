@@ -96,8 +96,8 @@ func TestStartedConnection(t *testing.T) {
 
 	require.Equal(t, "transport:connection_started", name)
 	require.JSONEq(t, `{
-		"local": {"ip_v4": {"ip": "192.168.13.37", "port": 42}},
-		"remote": {"ip_v6": {"ip": "2001:db8::1", "port": 24}}
+		"local": {"address_v4": {"ip": "192.168.13.37", "port": 42}},
+		"remote": {"address_v6": {"ip": "2001:db8::1", "port": 24}}
 	}`, ev)
 }
 
@@ -111,8 +111,8 @@ func TestTupleAssigned(t *testing.T) {
 	require.Equal(t, "transport:tuple_assigned", name)
 	require.JSONEq(t, `{
 		"tuple_id": "1",
-		"tuple_local": {"ip_v4": {"ip": "192.168.13.37", "port": 42}},
-		"tuple_remote": {"ip_v6": {"ip": "2001:db8::1", "port": 24}}
+		"tuple_local": {"address_v4": {"ip": "192.168.13.37", "port": 42}},
+		"tuple_remote": {"address_v6": {"ip": "2001:db8::1", "port": 24}}
 	}`, ev)
 }
 
@@ -274,10 +274,10 @@ func TestSentTransportParameters(t *testing.T) {
 		RetrySourceConnectionID:         &rcid,
 		StatelessResetToken:             &protocol.StatelessResetToken{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00},
 		DisableActiveMigration:          true,
-		MaxIdleTimeout:                  321 * time.Millisecond,
+		MaxIdleTimeout:                  321*time.Millisecond + 123*time.Microsecond,
 		MaxUDPPayloadSize:               1234,
 		AckDelayExponent:                12,
-		MaxAckDelay:                     123 * time.Millisecond,
+		MaxAckDelay:                     123*time.Millisecond + 123*time.Microsecond,
 		ActiveConnectionIDLimit:         7,
 		InitialMaxData:                  4000,
 		InitialMaxStreamDataBidiLocal:   1000,
@@ -324,8 +324,9 @@ func TestServerTransportParametersWithoutStatelessResetToken(t *testing.T) {
 	require.JSONEq(t, `{
 		"initiator": "local",
 		"original_destination_connection_id": "deadc0de",
-		"initial_source_connection_id": "(empty)",
+		"initial_source_connection_id": "",
 		"disable_active_migration": false,
+		"ack_delay_exponent": 0,
 		"active_connection_id_limit": 7,
 		"max_datagram_frame_size": 0
 	}`, ev)
@@ -341,10 +342,11 @@ func TestTransportParametersWithoutRetrySourceConnectionID(t *testing.T) {
 	require.Equal(t, "transport:parameters_set", name)
 	require.JSONEq(t, `{
 		"initiator": "local",
-		"original_destination_connection_id": "(empty)",
-		"initial_source_connection_id": "(empty)",
+		"original_destination_connection_id": "",
+		"initial_source_connection_id": "",
 		"stateless_reset_token": "112233445566778899aabbccddeeff00",
 		"disable_active_migration": false,
+		"ack_delay_exponent": 0,
 		"max_datagram_frame_size": 0
 	}`, ev)
 }
@@ -383,16 +385,17 @@ func testTransportParametersWithPreferredAddress(t *testing.T, hasIPv4, hasIPv6 
 	require.Equal(t, "transport:parameters_set", name)
 	var addresses string
 	if hasIPv4 {
-		addresses += `"ip_v4": {"ip": "12.34.56.78", "port": 123},`
+		addresses += `"address_v4": {"ip": "12.34.56.78", "port": 123},`
 	}
 	if hasIPv6 {
-		addresses += `"ip_v6": {"ip": "102:304:506:708:90a:b0c:d0e:f10", "port": 456},`
+		addresses += `"address_v6": {"ip": "102:304:506:708:90a:b0c:d0e:f10", "port": 456},`
 	}
 	require.JSONEq(t, fmt.Sprintf(`{
 		"initiator": "local",
-		"original_destination_connection_id": "(empty)",
-		"initial_source_connection_id": "(empty)",
+		"original_destination_connection_id": "",
+		"initial_source_connection_id": "",
 		"disable_active_migration": false,
+		"ack_delay_exponent": 0,
 		"max_datagram_frame_size": 0,
 		"preferred_address": {
 			%s
@@ -412,9 +415,10 @@ func TestTransportParametersWithDatagramExtension(t *testing.T) {
 	require.Equal(t, "transport:parameters_set", name)
 	require.JSONEq(t, `{
 		"initiator": "local",
-		"original_destination_connection_id": "(empty)",
-		"initial_source_connection_id": "(empty)",
+		"original_destination_connection_id": "",
+		"initial_source_connection_id": "",
 		"disable_active_migration": false,
+		"ack_delay_exponent": 0,
 		"max_datagram_frame_size": 1337
 	}`, ev)
 }
@@ -428,8 +432,9 @@ func TestReceivedTransportParameters(t *testing.T) {
 	require.Equal(t, "transport:parameters_set", name)
 	require.JSONEq(t, `{
 		"initiator": "remote",
-		"initial_source_connection_id": "(empty)",
+		"initial_source_connection_id": "",
 		"disable_active_migration": false,
+		"ack_delay_exponent": 0,
 		"max_datagram_frame_size": 0
 	}`, ev)
 }
@@ -446,7 +451,6 @@ func TestRestoredTransportParameters(t *testing.T) {
 
 	require.Equal(t, "transport:parameters_restored", name)
 	require.JSONEq(t, `{
-		"disable_active_migration": false,
 		"max_idle_timeout": 123,
 		"initial_max_data": 400,
 		"initial_max_stream_data_bidi_local": 100,
@@ -527,7 +531,7 @@ func testPacketSent1RTT(t *testing.T, datagramPayloadChecksum DatagramPayloadChe
 	}
 	require.JSONEq(t, fmt.Sprintf(`{
 		%s
-		"header": {"packet_type": "1RTT", "packet_number": 1337, "dcil": 4, "dcid": "01020304", "key_phase_bit": "0"},
+		"header": {"packet_type": "1RTT", "packet_number": 1337, "dcil": 4, "dcid": "01020304", "key_phase_bit": false},
 		"raw": {"length": 123},
 		"frames": [{"frame_type": "ack", "acked_ranges": [[1, 10]]}, {"frame_type": "max_data", "maximum": 987}]
 	}`, checksum), ev)
@@ -565,7 +569,7 @@ func TestPacketReceived(t *testing.T) {
 			"scid": "04030201",
 			"dcil": 8,
 			"dcid": "0102030405060708",
-			"token": {"data": "deadbeef"}
+			"token": {"raw": {"data": "deadbeef"}}
 		},
 		"raw": {"length": 789, "payload_length": 1234},
 		"frames": [
@@ -616,7 +620,7 @@ func testPacketReceived1RTT(t *testing.T, datagramPayloadChecksum DatagramPayloa
 			"packet_number": 1337,
 			"dcil": 8,
 			"dcid": "0102030405060708",
-			"key_phase_bit": "0"
+			"key_phase_bit": false
 		},
 		"raw": {"length": 789, "payload_length": 1234},
 		"frames": [
@@ -648,7 +652,7 @@ func TestPacketReceivedRetry(t *testing.T) {
 			"scid": "04030201",
 			"dcil": 8,
 			"dcid": "0102030405060708",
-			"token": {"data": "deadbeef"}
+			"token": {"raw": {"data": "deadbeef"}}
 		},
 		"raw": {"length": 123}
 	}`, ev)
@@ -731,7 +735,6 @@ func TestDatagramDropped(t *testing.T) {
 
 func TestRecoveryParametersSet(t *testing.T) {
 	parameters := RecoveryParametersSet{
-		EncryptionLevel:         protocol.Encryption1RTT,
 		ReorderingThreshold:     3,
 		TimeThreshold:           1.125,
 		TimerGranularity:        time.Millisecond,
@@ -741,7 +744,6 @@ func TestRecoveryParametersSet(t *testing.T) {
 	name, ev := testEventEncoding(t, &parameters)
 	require.Equal(t, "quic:recovery_parameters_set", name)
 	require.JSONEq(t, `{
-		"packet_number_space": "application_data",
 		"reordering_threshold": 3,
 		"time_threshold": 1.125,
 		"timer_granularity": 1,
@@ -756,7 +758,6 @@ func TestRecoveryParametersSet(t *testing.T) {
 	name, ev = testEventEncoding(t, &parameters)
 	require.Equal(t, "quic:recovery_parameters_set", name)
 	require.JSONEq(t, `{
-		"packet_number_space": "application_data",
 		"reordering_threshold": "disabled",
 		"time_threshold": 1.25,
 		"timer_granularity": 1
@@ -790,6 +791,14 @@ func TestMetricsUpdated(t *testing.T) {
 	require.Equal(t, float64(4321), ev["congestion_window"])
 	require.Equal(t, float64(1234), ev["bytes_in_flight"])
 	require.Equal(t, float64(42), ev["packets_in_flight"])
+	_, data = testEventEncoding(t, MetricsUpdated{CongestionWindow: 4321, SmoothedRTT: time.Millisecond})
+	require.JSONEq(t, `{
+		"smoothed_rtt": 1,
+		"rtt_variance": 0,
+		"congestion_window": 4321,
+		"bytes_in_flight": 0,
+		"packets_in_flight": 0
+	}`, data)
 }
 
 func TestPacketLost(t *testing.T) {
@@ -846,7 +855,7 @@ func TestMTUUpdated(t *testing.T) {
 
 	require.Equal(t, "recovery:mtu_updated", name)
 	require.JSONEq(t, `{
-		"mtu": 1337,
+		"new": 1337,
 		"done": true
 	}`, ev)
 }
@@ -986,7 +995,7 @@ func TestLossTimerUpdatedExpired(t *testing.T) {
 }
 
 func TestLossTimerUpdatedCanceled(t *testing.T) {
-	name, ev := testEventEncoding(t, &eventLossTimerCanceled{})
+	name, ev := testEventEncoding(t, &LossTimerUpdated{Type: LossTimerUpdateTypeCancelled})
 
 	require.Equal(t, "recovery:loss_timer_updated", name)
 	require.JSONEq(t, `{"event_type": "cancelled"}`, ev)
@@ -1021,7 +1030,9 @@ func TestALPNInformation(t *testing.T) {
 	})
 
 	require.Equal(t, "transport:alpn_information", name)
-	require.JSONEq(t, `{"chosen_alpn": "h3"}`, ev)
+	require.JSONEq(t, `{"chosen_alpn": {"string_value": "h3"}}`, ev)
+	_, ev = testEventEncoding(t, ALPNInformation{ChosenALPN: "\xff"})
+	require.JSONEq(t, `{"chosen_alpn": {"byte_value": "ff"}}`, ev)
 }
 
 func TestDebugEvent(t *testing.T) {
