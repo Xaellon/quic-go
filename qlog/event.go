@@ -8,7 +8,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/internal/qerr"
 	"github.com/quic-go/quic-go/qlogwriter"
 	"github.com/quic-go/quic-go/qlogwriter/jsontext"
 )
@@ -205,49 +204,12 @@ func (e ConnectionClosed) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	h.WriteToken(jsontext.String(string(e.Initiator)))
 	if e.ConnectionError != nil {
 		h.WriteToken(jsontext.String("connection_error"))
-		if e.ConnectionError.IsCryptoError() {
-			h.WriteToken(jsontext.String(fmt.Sprintf("crypto_error_%#x", uint16(*e.ConnectionError))))
+		if name := transportError(*e.ConnectionError).String(); name != "" {
+			h.WriteToken(jsontext.String(name))
 		} else {
-			switch *e.ConnectionError {
-			case qerr.NoError:
-				h.WriteToken(jsontext.String("no_error"))
-			case qerr.InternalError:
-				h.WriteToken(jsontext.String("internal_error"))
-			case qerr.ConnectionRefused:
-				h.WriteToken(jsontext.String("connection_refused"))
-			case qerr.FlowControlError:
-				h.WriteToken(jsontext.String("flow_control_error"))
-			case qerr.StreamLimitError:
-				h.WriteToken(jsontext.String("stream_limit_error"))
-			case qerr.StreamStateError:
-				h.WriteToken(jsontext.String("stream_state_error"))
-			case qerr.FinalSizeError:
-				h.WriteToken(jsontext.String("final_size_error"))
-			case qerr.FrameEncodingError:
-				h.WriteToken(jsontext.String("frame_encoding_error"))
-			case qerr.TransportParameterError:
-				h.WriteToken(jsontext.String("transport_parameter_error"))
-			case qerr.ConnectionIDLimitError:
-				h.WriteToken(jsontext.String("connection_id_limit_error"))
-			case qerr.ProtocolViolation:
-				h.WriteToken(jsontext.String("protocol_violation"))
-			case qerr.InvalidToken:
-				h.WriteToken(jsontext.String("invalid_token"))
-			case qerr.ApplicationErrorErrorCode:
-				h.WriteToken(jsontext.String("application_error"))
-			case qerr.CryptoBufferExceeded:
-				h.WriteToken(jsontext.String("crypto_buffer_exceeded"))
-			case qerr.KeyUpdateError:
-				h.WriteToken(jsontext.String("key_update_error"))
-			case qerr.AEADLimitReached:
-				h.WriteToken(jsontext.String("aead_limit_reached"))
-			case qerr.NoViablePathError:
-				h.WriteToken(jsontext.String("no_viable_path"))
-			default:
-				h.WriteToken(jsontext.String("unknown"))
-				h.WriteToken(jsontext.String("error_code"))
-				h.WriteToken(jsontext.Uint(uint64(*e.ConnectionError)))
-			}
+			h.WriteToken(jsontext.String("unknown"))
+			h.WriteToken(jsontext.String("error_code"))
+			h.WriteToken(jsontext.Uint(uint64(*e.ConnectionError)))
 		}
 	}
 	if e.ApplicationError != nil {
@@ -276,6 +238,7 @@ type PacketSent struct {
 	ECN                     ECN
 	Trigger                 string
 	SupportedVersions       []Version
+	IsMTUProbePacket        bool
 	// Tuple is the TupleID of the network tuple that the packet was sent on.
 	// It is empty for the tuple that the TupleID "" is assigned to.
 	Tuple string
@@ -311,6 +274,10 @@ func (e PacketSent) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	if e.Trigger != "" {
 		h.WriteToken(jsontext.String("trigger"))
 		h.WriteToken(jsontext.String(e.Trigger))
+	}
+	if e.IsMTUProbePacket {
+		h.WriteToken(jsontext.String("is_mtu_probe_packet"))
+		h.WriteToken(jsontext.True)
 	}
 	if e.Tuple != "" {
 		h.WriteToken(jsontext.String("tuple"))
@@ -649,8 +616,9 @@ func (e PTOCountUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
 }
 
 type PacketLost struct {
-	Header  PacketHeader
-	Trigger PacketLossReason
+	Header           PacketHeader
+	IsMTUProbePacket bool
+	Trigger          PacketLossReason
 }
 
 func (e PacketLost) Name() string { return "recovery:packet_lost" }
@@ -661,6 +629,10 @@ func (e PacketLost) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	h.WriteToken(jsontext.String("header"))
 	if err := e.Header.encode(enc); err != nil {
 		return err
+	}
+	if e.IsMTUProbePacket {
+		h.WriteToken(jsontext.String("is_mtu_probe_packet"))
+		h.WriteToken(jsontext.True)
 	}
 	h.WriteToken(jsontext.String("trigger"))
 	h.WriteToken(jsontext.String(string(e.Trigger)))
@@ -748,7 +720,7 @@ type ParametersSet struct {
 	SentBy                          protocol.Perspective
 	OriginalDestinationConnectionID protocol.ConnectionID
 	InitialSourceConnectionID       protocol.ConnectionID
-	RetrySourceConnectionID         *protocol.ConnectionID
+	RetrySourceConnectionID         protocol.ConnectionID
 	StatelessResetToken             *protocol.StatelessResetToken
 	DisableActiveMigration          bool
 	MaxIdleTimeout                  time.Duration
@@ -787,9 +759,9 @@ func (e ParametersSet) Encode(enc *jsontext.Encoder, _ time.Time) error {
 				h.WriteToken(jsontext.String("stateless_reset_token"))
 				h.WriteToken(jsontext.String(fmt.Sprintf("%x", e.StatelessResetToken[:])))
 			}
-			if e.RetrySourceConnectionID != nil {
+			if e.RetrySourceConnectionID.Valid() {
 				h.WriteToken(jsontext.String("retry_source_connection_id"))
-				h.WriteToken(jsontext.String(fmt.Sprintf("%x", (*e.RetrySourceConnectionID).Bytes())))
+				h.WriteToken(jsontext.String(fmt.Sprintf("%x", e.RetrySourceConnectionID.Bytes())))
 			}
 		}
 		h.WriteToken(jsontext.String("initial_source_connection_id"))

@@ -406,7 +406,7 @@ func (t *Transport) init(allowZeroLengthConnIDs bool) error {
 		}
 
 		if t.ConnectionIDGenerator != nil {
-			t.connIDGenerator = t.ConnectionIDGenerator
+			t.connIDGenerator = &appConnIDGenerator{ConnectionIDGenerator: t.ConnectionIDGenerator}
 			t.connIDLen = t.ConnectionIDGenerator.ConnectionIDLen()
 		} else {
 			connIDLen := t.ConnectionIDLength
@@ -749,6 +749,22 @@ func setTLSConfigServerName(tlsConf *tls.Config, addr net.Addr, host string) {
 	tlsConf.ServerName = h
 }
 
+// appConnIDGenerator wraps a ConnectionIDGenerator provided by the application.
+// It interprets the zero ConnectionID as a zero-length connection ID.
+type appConnIDGenerator struct {
+	ConnectionIDGenerator
+}
+
+var _ ConnectionIDGenerator = &appConnIDGenerator{}
+
+func (g *appConnIDGenerator) GenerateConnectionID() (ConnectionID, error) {
+	c, err := g.ConnectionIDGenerator.GenerateConnectionID()
+	if err == nil && !c.Valid() {
+		return protocol.ZeroLengthConnectionID, nil
+	}
+	return c, err
+}
+
 type packetHandlerMap Transport
 
 var _ connRunner = &packetHandlerMap{}
@@ -762,7 +778,9 @@ func (h *packetHandlerMap) Add(id protocol.ConnectionID, handler packetHandler) 
 		return false
 	}
 	h.handlers[id] = handler
-	h.logger.Debugf("Adding connection ID %s.", id)
+	if h.logger.Debug() {
+		h.logger.Debugf("Adding connection ID %s.", id)
+	}
 	return true
 }
 
@@ -795,7 +813,9 @@ func (h *packetHandlerMap) AddWithConnID(clientDestConnID, newConnID protocol.Co
 	}
 	h.handlers[clientDestConnID] = handler
 	h.handlers[newConnID] = handler
-	h.logger.Debugf("Adding connection IDs %s and %s for a new connection.", clientDestConnID, newConnID)
+	if h.logger.Debug() {
+		h.logger.Debugf("Adding connection IDs %s and %s for a new connection.", clientDestConnID, newConnID)
+	}
 	return true
 }
 
