@@ -219,8 +219,8 @@ const (
 type PacketDropReason string
 
 const (
-	// PacketDropKeyUnavailable is used when a packet is dropped because keys are unavailable
-	PacketDropKeyUnavailable PacketDropReason = "key_unavailable"
+	// PacketDropKeysUnavailable is used when a packet is dropped because keys are unavailable
+	PacketDropKeysUnavailable PacketDropReason = "keys_unavailable"
 	// PacketDropUnknownConnectionID is used when a packet is dropped because the connection ID is unknown
 	PacketDropUnknownConnectionID PacketDropReason = "unknown_connection_id"
 	// PacketDropHeaderParseError is used when a packet is dropped because header parsing failed
@@ -243,12 +243,35 @@ const (
 	PacketDropDuplicate PacketDropReason = "duplicate"
 )
 
-type LossTimerUpdateType string
+// trigger returns the packet_dropped trigger defined by the qlog draft.
+func (r PacketDropReason) trigger() string {
+	switch r {
+	case PacketDropKeysUnavailable:
+		return "keys_unavailable"
+	case PacketDropUnknownConnectionID:
+		return "connection_unknown"
+	case PacketDropHeaderParseError, PacketDropProtocolViolation, PacketDropUnexpectedPacket,
+		PacketDropUnexpectedSourceConnectionID, PacketDropUnexpectedVersion:
+		return "invalid"
+	case PacketDropPayloadDecryptError:
+		return "decryption_failure"
+	case PacketDropDOSPrevention:
+		return "rejected"
+	case PacketDropUnsupportedVersion:
+		return "unsupported"
+	case PacketDropDuplicate:
+		return "duplicate"
+	default:
+		return "general"
+	}
+}
+
+type TimerEventType string
 
 const (
-	LossTimerUpdateTypeSet       LossTimerUpdateType = "set"
-	LossTimerUpdateTypeExpired   LossTimerUpdateType = "expired"
-	LossTimerUpdateTypeCancelled LossTimerUpdateType = "cancelled"
+	TimerEventTypeSet       TimerEventType = "set"
+	TimerEventTypeExpired   TimerEventType = "expired"
+	TimerEventTypeCancelled TimerEventType = "cancelled"
 )
 
 type TimerType string
@@ -260,6 +283,21 @@ const (
 	TimerTypePTO TimerType = "pto"
 	// TimerTypePathProbe represents a path probe timer
 	TimerTypePathProbe TimerType = "path_probe"
+)
+
+type ConnectionState string
+
+const (
+	// ConnectionStateAttempted means that an Initial packet was sent or received
+	ConnectionStateAttempted ConnectionState = "attempted"
+	// ConnectionStateHandshakeStarted means that the Handshake keys are available
+	ConnectionStateHandshakeStarted ConnectionState = "handshake_started"
+	// ConnectionStateHandshakeComplete means that the TLS handshake completed
+	ConnectionStateHandshakeComplete ConnectionState = "handshake_complete"
+	// ConnectionStateHandshakeConfirmed means that the handshake was confirmed
+	ConnectionStateHandshakeConfirmed ConnectionState = "handshake_confirmed"
+	// ConnectionStateClosed means that the connection was closed
+	ConnectionStateClosed ConnectionState = "closed"
 )
 
 type CongestionState string

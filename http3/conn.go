@@ -93,15 +93,22 @@ func (c *rawConn) openControlStream(settings *settingsFrame) (*quic.SendStream, 
 	b = quicvarint.Append(b, streamTypeControlStream)
 	b = settings.Append(b)
 	if c.qlogger != nil {
+		c.qlogger.RecordEvent(qlog.StreamTypeSet{
+			Initiator:  qlog.InitiatorLocal,
+			StreamID:   str.StreamID(),
+			StreamType: qlog.StreamTypeControl,
+		})
 		sf := qlog.SettingsFrame{
 			MaxFieldSectionSize: settings.MaxFieldSectionSize,
+			Datagram:            -1,
+			ExtendedConnect:     -1,
 			Other:               maps.Clone(settings.Other),
 		}
 		if settings.Datagram {
-			sf.Datagram = new(uint64(1))
+			sf.Datagram = 1
 		}
 		if settings.ExtendedConnect {
-			sf.ExtendedConnect = new(uint64(1))
+			sf.ExtendedConnect = 1
 		}
 		c.qlogger.RecordEvent(qlog.FrameCreated{
 			StreamID: str.StreamID(),
@@ -175,6 +182,14 @@ func (c *rawConn) handleUnidirectionalStream(str *quic.ReceiveStream, isServer b
 			c.logger.Debug("reading stream type on stream failed", "stream ID", str.StreamID(), "error", err)
 		}
 		return
+	}
+	if c.qlogger != nil {
+		c.qlogger.RecordEvent(qlog.StreamTypeSet{
+			Initiator:       qlog.InitiatorRemote,
+			StreamID:        str.StreamID(),
+			StreamType:      qlogStreamType(streamType),
+			StreamTypeBytes: streamType,
+		})
 	}
 	// We're only interested in the control stream here.
 	switch streamType {

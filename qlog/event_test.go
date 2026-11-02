@@ -83,7 +83,7 @@ func TestRawInfo(t *testing.T) {
 }
 
 func TestStartedConnection(t *testing.T) {
-	var localInfo, remoteInfo PathEndpointInfo
+	var localInfo, remoteInfo TupleEndpointInfo
 	localInfo.IPv4 = netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 168, 13, 37}), 42)
 	ip, err := netip.ParseAddr("2001:db8::1")
 	require.NoError(t, err)
@@ -104,8 +104,8 @@ func TestStartedConnection(t *testing.T) {
 func TestTupleAssigned(t *testing.T) {
 	name, ev := testEventEncoding(t, &TupleAssigned{
 		TupleID: "1",
-		Local:   PathEndpointInfo{IPv4: netip.MustParseAddrPort("192.168.13.37:42")},
-		Remote:  PathEndpointInfo{IPv6: netip.MustParseAddrPort("[2001:db8::1]:24")},
+		Local:   TupleEndpointInfo{IPv4: netip.MustParseAddrPort("192.168.13.37:42")},
+		Remote:  TupleEndpointInfo{IPv6: netip.MustParseAddrPort("[2001:db8::1]:24")},
 	})
 
 	require.Equal(t, "transport:tuple_assigned", name)
@@ -440,18 +440,15 @@ func TestReceivedTransportParameters(t *testing.T) {
 }
 
 func TestRestoredTransportParameters(t *testing.T) {
-	name, ev := testEventEncoding(t, &ParametersSet{
-		Restore:                        true,
+	name, ev := testEventEncoding(t, &ParametersRestored{
 		InitialMaxStreamDataBidiLocal:  100,
 		InitialMaxStreamDataBidiRemote: 200,
 		InitialMaxStreamDataUni:        300,
 		InitialMaxData:                 400,
-		MaxIdleTimeout:                 123 * time.Millisecond,
 	})
 
 	require.Equal(t, "transport:parameters_restored", name)
 	require.JSONEq(t, `{
-		"max_idle_timeout": 123,
 		"initial_max_data": 400,
 		"initial_max_stream_data_bidi_local": 100,
 		"initial_max_stream_data_bidi_remote": 200,
@@ -705,7 +702,19 @@ func TestPacketDropped(t *testing.T) {
 		"header": {"packet_type": "retry"},
 		"raw": {"length": 1337},
 		"datagram_payload_checksum": 42,
-		"trigger": "payload_decrypt_error"
+		"trigger": "decryption_failure",
+		"details": {"reason": "payload_decrypt_error"}
+	}`, ev)
+
+	_, ev = testEventEncoding(t, &PacketDropped{
+		Header:  PacketHeader{PacketType: PacketTypeRetry},
+		Raw:     RawInfo{Length: 1337, PayloadLength: OmitLength},
+		Trigger: PacketDropDuplicate,
+	})
+	require.JSONEq(t, `{
+		"header": {"packet_type": "retry"},
+		"raw": {"length": 1337},
+		"trigger": "duplicate"
 	}`, ev)
 }
 
@@ -866,6 +875,13 @@ func TestMTUUpdated(t *testing.T) {
 	}`, ev)
 }
 
+func TestConnectionStateUpdated(t *testing.T) {
+	name, ev := testEventEncoding(t, &ConnectionStateUpdated{State: ConnectionStateHandshakeConfirmed})
+
+	require.Equal(t, "quic:connection_state_updated", name)
+	require.JSONEq(t, `{"new": "handshake_confirmed"}`, ev)
+}
+
 func TestCongestionStateUpdated(t *testing.T) {
 	name, ev := testEventEncoding(t, &CongestionStateUpdated{
 		State: CongestionStateCongestionAvoidance,
@@ -952,7 +968,7 @@ func TestKeyDiscarded(t *testing.T) {
 	}`, ev)
 }
 
-func TestLossTimerUpdated(t *testing.T) {
+func TestTimerUpdated(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var buf bytes.Buffer
 		tr := qlogwriter.NewConnectionFileSeq(
@@ -966,8 +982,8 @@ func TestLossTimerUpdated(t *testing.T) {
 		synctest.Wait()
 		time.Sleep(42 * time.Second)
 
-		producer.RecordEvent(&LossTimerUpdated{
-			Type:      LossTimerUpdateTypeSet,
+		producer.RecordEvent(&TimerUpdated{
+			Type:      TimerEventTypeSet,
 			TimerType: TimerTypePTO,
 			EncLevel:  protocol.EncryptionHandshake,
 			Time:      time.Now().Add(1337 * time.Second),
@@ -985,9 +1001,9 @@ func TestLossTimerUpdated(t *testing.T) {
 	})
 }
 
-func TestLossTimerUpdatedExpired(t *testing.T) {
-	name, ev := testEventEncoding(t, &LossTimerUpdated{
-		Type:      LossTimerUpdateTypeExpired,
+func TestTimerUpdatedExpired(t *testing.T) {
+	name, ev := testEventEncoding(t, &TimerUpdated{
+		Type:      TimerEventTypeExpired,
 		TimerType: TimerTypeACK,
 		EncLevel:  protocol.Encryption1RTT,
 	})
@@ -1000,8 +1016,8 @@ func TestLossTimerUpdatedExpired(t *testing.T) {
 	}`, ev)
 }
 
-func TestLossTimerUpdatedCanceled(t *testing.T) {
-	name, ev := testEventEncoding(t, &LossTimerUpdated{Type: LossTimerUpdateTypeCancelled})
+func TestTimerUpdatedCanceled(t *testing.T) {
+	name, ev := testEventEncoding(t, &TimerUpdated{Type: TimerEventTypeCancelled})
 
 	require.Equal(t, "recovery:loss_timer_updated", name)
 	require.JSONEq(t, `{"event_type": "cancelled"}`, ev)

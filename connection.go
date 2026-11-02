@@ -363,7 +363,7 @@ var newConnection = func(
 		params.MaxDatagramFrameSize = protocol.InvalidByteCount
 	}
 	if s.qlogger != nil {
-		s.qlogTransportParameters(params, protocol.PerspectiveServer, false)
+		s.qlogTransportParameters(params, protocol.PerspectiveServer)
 	}
 	cs := handshake.NewCryptoSetupServer(
 		clientDestConnID,
@@ -499,7 +499,7 @@ var newClientConnection = func(
 		params.MaxDatagramFrameSize = protocol.InvalidByteCount
 	}
 	if s.qlogger != nil {
-		s.qlogTransportParameters(params, protocol.PerspectiveClient, false)
+		s.qlogTransportParameters(params, protocol.PerspectiveClient)
 	}
 	cs := handshake.NewCryptoSetupClient(
 		destConnID,
@@ -968,6 +968,7 @@ func (c *Conn) handleHandshakeComplete(now monotime.Time) error {
 		c.qlogger.RecordEvent(qlog.ALPNInformation{
 			ChosenALPN: c.cryptoStreamHandler.ConnectionState().NegotiatedProtocol,
 		})
+		c.qlogger.RecordEvent(qlog.ConnectionStateUpdated{State: qlog.ConnectionStateHandshakeComplete})
 	}
 
 	// The server applies transport parameters right away, but the client side has to wait for handshake completion.
@@ -1011,6 +1012,9 @@ func (c *Conn) handleHandshakeConfirmed(now monotime.Time) error {
 
 	c.handshakeConfirmed = true
 	c.cryptoStreamHandler.SetHandshakeConfirmed()
+	if c.qlogger != nil {
+		c.qlogger.RecordEvent(qlog.ConnectionStateUpdated{State: qlog.ConnectionStateHandshakeConfirmed})
+	}
 
 	if !c.config.DisablePathMTUDiscovery && c.conn.capabilities().DF {
 		c.mtuDiscoverer.Start(now)
@@ -1453,7 +1457,7 @@ func (c *Conn) handleUnpackError(err error, p receivedPacket, pt qlog.PacketType
 				},
 				Raw:                     qlog.RawInfo{Length: int(p.Size()), PayloadLength: qlog.OmitLength},
 				DatagramPayloadChecksum: datagramPayloadChecksum,
-				Trigger:                 qlog.PacketDropKeyUnavailable,
+				Trigger:                 qlog.PacketDropKeysUnavailable,
 			})
 		}
 		c.logger.Debugf("Dropping %s packet (%d bytes) because we already dropped the keys.", pt, p.Size())
@@ -1756,6 +1760,7 @@ func (c *Conn) handleUnpackedLongHeaderPacket(
 					destAddr = addr
 				}
 				c.qlogger.RecordEvent(startedConnectionEvent(srcAddr, destAddr))
+				c.qlogger.RecordEvent(qlog.ConnectionStateUpdated{State: qlog.ConnectionStateAttempted})
 			}
 		}
 	}
@@ -2095,6 +2100,9 @@ func (c *Conn) handleHandshakeEvents(now monotime.Time) error {
 			switch ev.Kind {
 			case handshake.EventReceivedHandshakeReadKeys:
 				err = c.cryptoStreamManager.Finish(protocol.EncryptionInitial)
+				if c.qlogger != nil {
+					c.qlogger.RecordEvent(qlog.ConnectionStateUpdated{State: qlog.ConnectionStateHandshakeStarted})
+				}
 			case handshake.EventReceived1RTTReadKeys:
 				err = c.cryptoStreamManager.Finish(protocol.EncryptionHandshake)
 			}
@@ -2372,6 +2380,7 @@ func (c *Conn) handleCloseError(closeErr *closeError) {
 			Trigger:          trigger,
 			Reason:           reason,
 		})
+		c.qlogger.RecordEvent(qlog.ConnectionStateUpdated{State: qlog.ConnectionStateClosed})
 	}
 
 	// If this is a remote close we're done here
@@ -2417,9 +2426,7 @@ func (c *Conn) restoreTransportParameters(params *wire.TransportParameters) {
 		c.logger.Debugf("Restoring Transport Parameters: %s", params)
 	}
 	if c.qlogger != nil {
-		// only log the parameters that are saved in the session ticket
-		c.qlogger.RecordEvent(qlog.ParametersSet{
-			Restore:                        true,
+		c.qlogger.RecordEvent(qlog.ParametersRestored{
 			ActiveConnectionIDLimit:        params.ActiveConnectionIDLimit,
 			InitialMaxData:                 params.InitialMaxData,
 			InitialMaxStreamDataBidiLocal:  params.InitialMaxStreamDataBidiLocal,
@@ -2440,7 +2447,7 @@ func (c *Conn) restoreTransportParameters(params *wire.TransportParameters) {
 
 func (c *Conn) handleTransportParameters(params *wire.TransportParameters) error {
 	if c.qlogger != nil {
-		c.qlogTransportParameters(params, c.perspective.Opposite(), false)
+		c.qlogTransportParameters(params, c.perspective.Opposite())
 	}
 	if err := c.checkTransportParameters(params); err != nil {
 		return &qerr.TransportError{
@@ -2619,6 +2626,9 @@ func (c *Conn) sendPackets(now monotime.Time) error {
 		packet, err := c.packer.PackCoalescedPacket(false, c.maxPacketSize(), now, c.version)
 		if err != nil || packet == nil {
 			return err
+		}
+		if !c.sentFirstPacket && c.perspective == protocol.PerspectiveClient && c.qlogger != nil {
+			c.qlogger.RecordEvent(qlog.ConnectionStateUpdated{State: qlog.ConnectionStateAttempted})
 		}
 		c.sentFirstPacket = true
 		if err := c.sendPackedCoalescedPacket(packet, c.sentPacketHandler.ECNMode(packet.IsOnlyShortHeaderPacket()), now); err != nil {

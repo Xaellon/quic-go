@@ -2,6 +2,12 @@ on: [push, pull_request]
 
 permissions: read-all
 
+# On PRs, a new push cancels outdated runs.
+# Other runs use the run ID as the group, so they never wait for or cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   unit:
     strategy:
@@ -43,13 +49,14 @@ jobs:
         if: ${{ matrix.os == 'ubuntu' }} # speed things up. Windows and OSX VMs are slow
         env:
           TIMESCALE_FACTOR: 20
-        run: go test -v -shuffle on ./...
+        run: go test -v -race -shuffle on ./...
       - name: Run handshake tests in FIPS140 mode
         env:
           GODEBUG: fips140=only
         run: go test -v ./internal/handshake -run 'TestToken|TestRetry|TestInitial|TestDecode|TestEncrypt'
       - name: Run benchmark tests
-        run: go test -v -run=^$ -benchtime 0.5s -bench=. ./...
+        # only check that the benchmarks still work, including when run for multiple iterations
+        run: go test -v -run=^$ -benchtime 10x -bench=. ./...
       - name: Upload coverage to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
