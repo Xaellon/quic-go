@@ -101,13 +101,13 @@ type closeError struct {
 	immediate bool
 }
 
-type errCloseForRecreating struct {
+type errSwitchVersion struct {
 	nextPacketNumber protocol.PacketNumber
 	nextVersion      protocol.Version
 }
 
-func (e *errCloseForRecreating) Error() string {
-	return "closing connection in order to recreate it"
+func (e *errSwitchVersion) Error() string {
+	return "closing connection to switch to a different QUIC version"
 }
 
 var deadlineSendImmediately = monotime.Time(42 * time.Millisecond) // any value > time.Time{} and before time.Now() is fine
@@ -753,9 +753,7 @@ runLoop:
 	c.sendQueue.Close() // close the send queue before sending the CONNECTION_CLOSE
 	c.handleCloseError(closeErr)
 	if c.qlogger != nil {
-		if _, ok := errors.AsType[*errCloseForRecreating](closeErr.err); !ok {
-			c.qlogger.Close()
-		}
+		c.qlogger.Close()
 	}
 	c.logger.Infof("Connection %s closed.", c.logID)
 	c.timer.Stop()
@@ -1705,7 +1703,7 @@ func (c *Conn) handleVersionNegotiationPacket(p receivedPacket) error {
 
 	c.logger.Infof("Switching to QUIC version %s.", newVersion)
 	nextPN, _ := c.sentPacketHandler.PeekPacketNumber(protocol.PacketNumberSpaceInitial)
-	return &errCloseForRecreating{
+	return &errSwitchVersion{
 		nextPacketNumber: nextPN,
 		nextVersion:      newVersion,
 	}
@@ -2318,7 +2316,7 @@ func (c *Conn) handleCloseError(closeErr *closeError) {
 
 	_, isStatelessReset := errors.AsType[*StatelessResetError](e)
 	_, isVersionNegotiation := errors.AsType[*VersionNegotiationError](e)
-	_, isRecreate := errors.AsType[*errCloseForRecreating](e)
+	_, isSwitchVersion := errors.AsType[*errSwitchVersion](e)
 	applicationErr, isApplicationError := errors.AsType[*ApplicationError](e)
 	transportErr, isTransportError := errors.AsType[*TransportError](e)
 
@@ -2333,9 +2331,8 @@ func (c *Conn) handleCloseError(closeErr *closeError) {
 		trigger = qlog.ConnectionCloseTriggerIdleTimeout
 	case isStatelessReset:
 		trigger = qlog.ConnectionCloseTriggerStatelessReset
-	case isVersionNegotiation:
+	case isVersionNegotiation, isSwitchVersion:
 		trigger = qlog.ConnectionCloseTriggerVersionMismatch
-	case isRecreate:
 	case isApplicationError:
 		isRemoteClose = applicationErr.Remote
 		reason = applicationErr.ErrorMessage
@@ -2368,7 +2365,7 @@ func (c *Conn) handleCloseError(closeErr *closeError) {
 	// handler map when it is closed, so we need to make sure that this happens last.
 	defer c.connIDManager.Close()
 
-	if c.qlogger != nil && !isRecreate {
+	if c.qlogger != nil {
 		initiator := qlog.InitiatorLocal
 		if isRemoteClose || trigger == qlog.ConnectionCloseTriggerStatelessReset {
 			initiator = qlog.InitiatorRemote
@@ -2393,8 +2390,8 @@ func (c *Conn) handleCloseError(closeErr *closeError) {
 		return
 	}
 	// Don't send out any CONNECTION_CLOSE if this is an error that occurred
-	// before we even sent out the first packet.
-	if c.perspective == protocol.PerspectiveClient && !c.sentFirstPacket {
+	// before we even sent out the first packet, or if we're switching to a different QUIC version.
+	if isSwitchVersion || (c.perspective == protocol.PerspectiveClient && !c.sentFirstPacket) {
 		c.connIDGenerator.RemoveAll()
 		return
 	}
