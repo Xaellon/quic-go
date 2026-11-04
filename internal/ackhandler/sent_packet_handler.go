@@ -16,18 +16,20 @@ import (
 )
 
 const (
+	// Extra RTT allowance for time-threshold loss detection, in eighths of an RTT.
 	defaultTimeThresholdEighths = 1
 	maxTimeThresholdEighths     = 8
-
+	// Maximum reordering in packets before packet threshold loss detection considers a packet lost.
 	packetThreshold = 3
-
+	// Before validating the client's address, the server won't send more than 3x bytes than it received.
 	amplificationFactor = 3
-
+	// We use Retry packets to derive an RTT estimate. Make sure we don't set the RTT to a super low value yet.
 	minRTTAfterRetry = 5 * time.Millisecond
-
+	// The PTO duration uses exponential backoff, but is truncated to a maximum value, as allowed by RFC 8961, section 4.4.
 	maxPTODuration = 60 * time.Second
 )
 
+// Path probe packets are declared lost after this time.
 const pathProbePacketLossTimeout = time.Second
 
 type packetNumberSpace struct {
@@ -72,6 +74,8 @@ func (p *handshakePacketNumbers) Highest() protocol.PacketNumber {
 }
 
 type sentPacketHandler struct {
+	// Packet numbers and their history are shared across encryption levels.
+	// ACK processing and loss detection still use the state for each space.
 	pns  *packetNumberGenerator
 	hist sentPacketHistory
 
@@ -80,26 +84,31 @@ type sentPacketHandler struct {
 	initialPackets   *packetNumberSpace
 	handshakePackets *packetNumberSpace
 	appDataPackets   *packetNumberSpace
-	lostPackets      lostPacketTracker
-
+	lostPackets      lostPacketTracker // only for application-data packet number space
+	// send time of the largest acknowledged packet, across all packet number spaces
 	largestAckedTime monotime.Time
 
+	// In the application-data packet number space, packet threshold loss detection is
+	// disabled when spurious losses are detected.
 	packetThresholdDisabled bool
 	timeThresholdEighths    uint8
-
+	// Only packets sent after a time-threshold increase can trigger another one.
 	minPNToRelaxReordering protocol.PacketNumber
 
+	// Do we know that the peer completed address validation yet?
+	// Always true for the server.
 	peerCompletedAddressValidation bool
 	bytesReceived                  protocol.ByteCount
 	bytesSent                      protocol.ByteCount
-
+	// Have we validated the peer's address yet?
+	// Always true for the client.
 	peerAddressValidated bool
 
 	handshakeConfirmed bool
 
 	ignorePacketsBelow func(protocol.PacketNumber)
 
-	ackedPackets []packetWithPacketNumber
+	ackedPackets []packetWithPacketNumber // to avoid allocations in detectAndRemoveAckedPackets
 
 	bytesInFlight protocol.ByteCount
 
@@ -108,11 +117,14 @@ type sentPacketHandler struct {
 	rttStats      *utils.RTTStats
 	connStats     *utils.ConnectionStats
 
+	// The number of times a PTO has been sent without receiving an ack.
 	ptoCount uint32
 	ptoMode  SendMode
-
+	// The number of PTO probe packets that should be sent.
+	// Only applies to the application-data packet number space.
 	numProbesToSend int
 
+	// The alarm timeout
 	alarm alarmTimer
 
 	enableECN  bool
@@ -127,6 +139,8 @@ type sentPacketHandler struct {
 
 var _ SentPacketHandler = &sentPacketHandler{}
 
+// clientAddressValidated indicates whether the address was validated beforehand by an address validation token.
+// If the address was validated, the amplification limit doesn't apply. It has no effect for a client.
 func NewSentPacketHandler(
 	initialPN protocol.PacketNumber,
 	initialMaxDatagramSize protocol.ByteCount,
@@ -221,13 +235,14 @@ func (h *sentPacketHandler) DropPackets(encLevel protocol.EncryptionLevel, now m
 	if encLevel == protocol.Encryption1RTT {
 		panic(fmt.Sprintf("Cannot drop keys for encryption level %s", encLevel))
 	}
-
+	// The server won't await address validation after the handshake is confirmed.
+	// This applies even if we didn't receive an ACK for a Handshake packet.
 	if h.perspective == protocol.PerspectiveClient && encLevel == protocol.EncryptionHandshake {
 		h.peerCompletedAddressValidation = true
 	}
-
+	// remove packets from the history and bytes_in_flight
 	pnSpace := h.getPacketNumberSpace(encLevel.PacketNumberSpace())
-
+	// We might already have dropped this packet number space.
 	if pnSpace == nil {
 		return
 	}
@@ -235,7 +250,7 @@ func (h *sentPacketHandler) DropPackets(encLevel protocol.EncryptionLevel, now m
 		if pn > pnSpace.largestSent {
 			break
 		}
-
+		// no 0-RTT packets are sent after the first 1-RTT packet
 		if encLevel == protocol.Encryption0RTT && p.EncryptionLevel == protocol.Encryption1RTT {
 			break
 		}
@@ -245,17 +260,19 @@ func (h *sentPacketHandler) DropPackets(encLevel protocol.EncryptionLevel, now m
 		h.removeFromBytesInFlight(p)
 		h.hist.Remove(pn)
 	}
-
-	//nolint:exhaustive
+	// drop the packet number space
+	//nolint:exhaustive // Not every packet number space can be dropped.
 	switch encLevel {
 	case protocol.EncryptionInitial:
 		h.initialPackets = nil
 	case protocol.EncryptionHandshake:
-
+		// Dropping the handshake packet number space means that the handshake is confirmed,
+		// see section 4.9.2 of RFC 9001.
 		h.handshakeConfirmed = true
 		h.handshakePackets = nil
 	case protocol.Encryption0RTT:
-
+		// This function is only called when 0-RTT is rejected,
+		// and not when the client drops 0-RTT keys when the handshake completes.
 	}
 	if h.qlogger != nil && h.ptoCount != 0 {
 		h.qlogger.RecordEvent(qlog.PTOCountUpdated{PTOCount: 0})
@@ -304,7 +321,7 @@ func (h *sentPacketHandler) SentPacket(
 		h.minPNToRelaxReordering == protocol.InvalidPacketNumber {
 		h.minPNToRelaxReordering = pn
 	}
-	//nolint:exhaustive
+	//nolint:exhaustive // Only Initial and Handshake packet numbers are stored separately.
 	switch encLevel {
 	case protocol.EncryptionInitial:
 		h.handshakePNs.Initial = append(h.handshakePNs.Initial, pn)
@@ -417,7 +434,7 @@ func (h *sentPacketHandler) getPacketNumberSpace(space protocol.PacketNumberSpac
 	}
 }
 
-func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.EncryptionLevel, rcvTime monotime.Time) (bool, error) {
+func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.EncryptionLevel, rcvTime monotime.Time) (bool /* contained 1-RTT packet */, error) {
 	pnSpace := h.getPacketNumberSpace(encLevel.PacketNumberSpace())
 
 	largestAcked := ack.LargestAcked()
@@ -428,11 +445,12 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		}
 	}
 
+	// Servers complete address validation when a protected packet is received.
 	if h.perspective == protocol.PerspectiveClient && !h.peerCompletedAddressValidation &&
 		(encLevel == protocol.EncryptionHandshake || encLevel == protocol.Encryption1RTT) {
 		h.peerCompletedAddressValidation = true
 		h.logger.Debugf("Peer doesn't await address validation any longer.")
-
+		// Make sure that the timer is reset, even if this ACK doesn't acknowledge any (ack-eliciting) packets.
 		h.setLossDetectionTimer(rcvTime)
 	}
 
@@ -441,10 +459,12 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	if err != nil {
 		return false, err
 	}
-
+	// update the RTT, if:
+	// * the largest acked is newly acknowledged, AND
+	// * at least one new ack-eliciting packet was acknowledged
 	if len(ackedPackets) > 0 {
 		if p := ackedPackets[len(ackedPackets)-1]; p.PacketNumber == ack.LargestAcked() && !p.isPathProbePacket && hasAckEliciting {
-
+			// don't use the ack delay for Initial and Handshake packets
 			var ackDelay time.Duration
 			if encLevel == protocol.Encryption1RTT {
 				ackDelay = min(ack.DelayTime, h.rttStats.MaxAckDelay())
@@ -460,6 +480,7 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		}
 	}
 
+	// Detect spurious losses even if no outstanding packets were newly acknowledged.
 	var spuriousLosses []protocol.PacketNumber
 	var timeThresholdIncreased bool
 	if encLevel == protocol.Encryption1RTT {
@@ -467,11 +488,11 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 			ack,
 			rcvTime.Add(-min(ack.DelayTime, h.rttStats.MaxAckDelay())),
 		)
-
+		// clean up lost packet history
 		h.lostPackets.DeleteBefore(rcvTime.Add(-3 * h.rttStats.PTO(false)))
 	}
 	if len(ackedPackets) > 0 {
-
+		// Only inform the ECN tracker about new 1-RTT ACKs if the ACK increases the largest acked.
 		if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil && largestAcked > pnSpace.largestAcked {
 			congested := h.ecnTracker.HandleNewlyAcked(ackedPackets, int64(ack.ECT0), int64(ack.ECT1), int64(ack.ECNCE))
 			if congested {
@@ -481,14 +502,15 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 
 		pnSpace.largestAcked = max(pnSpace.largestAcked, largestAcked)
 	}
-
+	// new acked packets can advance largestAcked or update the RTT,
+	// and a larger time threshold moves the loss deadline
 	if len(ackedPackets) > 0 || timeThresholdIncreased {
 		h.detectLostPackets(rcvTime, encLevel)
 		if encLevel == protocol.Encryption1RTT {
 			h.detectLostPathProbes(rcvTime)
 		}
 	}
-
+	// report spurious losses after any new congestion events from this ACK
 	for _, pn := range spuriousLosses {
 		h.congestion.OnSpuriousLoss(pn)
 	}
@@ -520,10 +542,13 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		return false, nil
 	}
 
-	ackedPackets = nil //nolint:ineffassign
-	clear(h.ackedPackets)
+	// After this point, we must not use ackedPackets any longer!
+	// We've already returned the buffers.
+	ackedPackets = nil    //nolint:ineffassign // This is just to be on the safe side.
+	clear(h.ackedPackets) // make sure the memory is released
 	h.ackedPackets = h.ackedPackets[:0]
 
+	// Reset the pto_count unless the client is unsure if the server has validated the client's address.
 	if h.peerCompletedAddressValidation {
 		if h.qlogger != nil && h.ptoCount != 0 {
 			h.qlogger.RecordEvent(qlog.PTOCountUpdated{PTOCount: 0})
@@ -596,6 +621,7 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 	return spuriousLosses, timeThresholdIncreased
 }
 
+// Packets are returned in ascending packet number order.
 func (h *sentPacketHandler) detectAndRemoveAckedPackets(
 	ack *wire.AckFrame,
 	encLevel protocol.EncryptionLevel,
@@ -619,7 +645,7 @@ func (h *sentPacketHandler) detectAndRemoveAckedPackets(
 	lowestAcked := ack.LowestAcked()
 	largestAcked := ack.LargestAcked()
 	for pn, p := range h.hist.Packets() {
-
+		// ignore packets below the lowest acked
 		if pn < lowestAcked {
 			continue
 		}
@@ -638,7 +664,7 @@ func (h *sentPacketHandler) detectAndRemoveAckedPackets(
 				ackRange = ack.AckRanges[len(ack.AckRanges)-1-ackRangeIndex]
 			}
 
-			if pn < ackRange.Smallest {
+			if pn < ackRange.Smallest { // packet not contained in ACK range
 				continue
 			}
 			if pn > ackRange.Largest {
@@ -647,7 +673,7 @@ func (h *sentPacketHandler) detectAndRemoveAckedPackets(
 		}
 		if p.isPathProbePacket {
 			probePacket := h.hist.RemovePathProbe(pn)
-
+			// the probe packet might already have been declared lost
 			if probePacket != nil {
 				h.ackedPackets = append(h.ackedPackets, packetWithPacketNumber{PacketNumber: pn, packet: probePacket})
 			}
@@ -685,7 +711,7 @@ func (h *sentPacketHandler) detectAndRemoveAckedPackets(
 			return nil, false, err
 		}
 	}
-
+	// TODO: add support for the transport:packets_acked qlog event
 	return h.ackedPackets, hasAckEliciting, nil
 }
 
@@ -716,7 +742,10 @@ func (h *sentPacketHandler) getScaledPTO(includeMaxAckDelay bool) time.Duration 
 	return pto
 }
 
+// same logic as getLossTimeAndSpace, but for lastAckElicitingPacketTime instead of lossTime
 func (h *sentPacketHandler) getPTOTimeAndSpace(now monotime.Time) (pto monotime.Time, encLevel protocol.EncryptionLevel) {
+	// We only send application data probe packets once the handshake is confirmed,
+	// because before that, we don't have the keys to decrypt ACKs sent in 1-RTT packets.
 	if !h.handshakeConfirmed && !h.hasOutstandingCryptoPackets() {
 		if h.peerCompletedAddressValidation {
 			return
@@ -765,7 +794,7 @@ func (h *sentPacketHandler) hasOutstandingCryptoPackets() bool {
 }
 
 func (h *sentPacketHandler) setLossDetectionTimer(now monotime.Time) {
-	oldAlarm := h.alarm
+	oldAlarm := h.alarm // only needed in case tracing is enabled
 	newAlarm := h.lossDetectionTime(now)
 	h.alarm = newAlarm
 
@@ -790,10 +819,12 @@ func (h *sentPacketHandler) setLossDetectionTimer(now monotime.Time) {
 }
 
 func (h *sentPacketHandler) lossDetectionTime(now monotime.Time) alarmTimer {
+	// cancel the alarm if no packets are outstanding
 	if h.peerCompletedAddressValidation && !h.hist.HasOutstandingPackets() && !h.hist.HasOutstandingPathProbes() {
 		return alarmTimer{}
 	}
 
+	// cancel the alarm if amplification limited
 	if h.isAmplificationLimited() {
 		return alarmTimer{}
 	}
@@ -805,6 +836,7 @@ func (h *sentPacketHandler) lossDetectionTime(now monotime.Time) alarmTimer {
 		}
 	}
 
+	// early retransmit timer or time loss detection
 	lossTime, encLevel := h.getLossTimeAndSpace()
 	if !lossTime.IsZero() && (pathProbeLossTime.IsZero() || lossTime.Before(pathProbeLossTime)) {
 		return alarmTimer{
@@ -836,7 +868,7 @@ func (h *sentPacketHandler) detectLostPathProbes(now monotime.Time) {
 		return
 	}
 	lossTime := now.Add(-pathProbePacketLossTimeout)
-
+	// RemovePathProbe cannot be called while iterating.
 	var lostPathProbes []packetWithPacketNumber
 	for pn, p := range h.hist.PathProbes() {
 		if !p.SendTime.After(lossTime) {
@@ -879,6 +911,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 		protocol.TimerGranularity,
 	)
 
+	// Packets sent before this time are deemed lost.
 	lostSendTime := now.Add(-lossDelay)
 
 	priorInFlight := h.bytesInFlight
@@ -939,7 +972,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 				}
 			}
 		} else if pnSpace.lossTime.IsZero() {
-
+			// Note: This conditional is only entered once per call
 			lossTime := p.SendTime.Add(lossDelay)
 			if h.logger.Debug() {
 				h.logger.Debugf("\tsetting loss timer for packet %d (%s) to %s (in %s)", pn, encLevel, lossDelay, lossTime)
@@ -952,7 +985,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 			}
 			h.hist.DeclareLost(pn)
 			if !p.isPathProbePacket && p.IsAckEliciting() {
-
+				// the bytes in flight need to be reduced no matter if the frames in this packet will be retransmitted
 				h.removeFromBytesInFlight(p)
 				h.queueFramesForRetransmission(p)
 				if !p.IsPathMTUProbePacket {
@@ -992,11 +1025,16 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 				EncLevel:  encLevel,
 			})
 		}
-
+		// Early retransmit or time loss detection
 		h.detectLostPackets(now, encLevel)
 		return nil
 	}
 
+	// PTO
+	// When all outstanding are acknowledged, the alarm is canceled in setLossDetectionTimer.
+	// However, there's no way to reset the timer in the connection.
+	// When OnLossDetectionTimeout is called, we therefore need to make sure that there are
+	// actually packets outstanding.
 	if h.bytesInFlight == 0 && !h.peerCompletedAddressValidation {
 		h.ptoCount++
 		h.numProbesToSend++
@@ -1031,14 +1069,14 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 		h.qlogger.RecordEvent(qlog.PTOCountUpdated{PTOCount: h.ptoCount})
 	}
 	h.numProbesToSend += 2
-	//nolint:exhaustive
+	//nolint:exhaustive // We never arm a PTO timer for 0-RTT packets.
 	switch encLevel {
 	case protocol.EncryptionInitial:
 		h.ptoMode = SendPTOInitial
 	case protocol.EncryptionHandshake:
 		h.ptoMode = SendPTOHandshake
 	case protocol.Encryption1RTT:
-
+		// skip a packet number in order to elicit an immediate ACK
 		pn := h.PopPacketNumber(protocol.PacketNumberSpaceAppData)
 		h.hist.SkippedPacket(pn)
 		h.ptoMode = SendPTOAppData
@@ -1065,7 +1103,7 @@ func (h *sentPacketHandler) ECNMode(isShortHeaderPacket bool) protocol.ECN {
 func (h *sentPacketHandler) PeekPacketNumber(space protocol.PacketNumberSpace) (protocol.PacketNumber, protocol.PacketNumberLen) {
 	pnSpace := h.getPacketNumberSpace(space)
 	pn := h.pns.Peek(space == protocol.PacketNumberSpaceAppData)
-
+	// See section 17.1 of RFC 9000.
 	return pn, protocol.PacketNumberLengthForHeader(pn, pnSpace.largestAcked)
 }
 
@@ -1088,7 +1126,10 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 		h.logger.Debugf("Amplification window limited. Received %d bytes, already sent out %d bytes", h.bytesReceived, h.bytesSent)
 		return SendNone
 	}
-
+	// Don't send any packets if we're keeping track of the maximum number of packets.
+	// Note that since MaxOutstandingSentPackets is smaller than MaxTrackedSentPackets,
+	// we will stop sending out new data when reaching MaxOutstandingSentPackets,
+	// but still allow sending of retransmissions and ACKs.
 	if numTrackedPackets >= protocol.MaxTrackedSentPackets {
 		if h.logger.Debug() {
 			h.logger.Debugf("Limited by the number of tracked packets: tracking %d packets, maximum %d", numTrackedPackets, protocol.MaxTrackedSentPackets)
@@ -1098,7 +1139,7 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 	if h.numProbesToSend > 0 {
 		return h.ptoMode
 	}
-
+	// Only send ACKs if we're congestion limited.
 	if !h.congestion.CanSend(h.bytesInFlight) {
 		if h.logger.Debug() {
 			h.logger.Debugf("Congestion limited: bytes in flight %d, window %d", h.bytesInFlight, h.congestion.GetCongestionWindow())
@@ -1137,7 +1178,9 @@ func (h *sentPacketHandler) QueueProbePacket(space protocol.PacketNumberSpace) b
 	if p == nil {
 		return false
 	}
-
+	// TODO: don't declare the packet lost here.
+	// Keep track of acknowledged frames instead.
+	// Call DeclareLost before queueFramesForRetransmission, which clears the packet's frames.
 	h.hist.DeclareLost(pn)
 	h.removeFromBytesInFlight(p)
 	h.queueFramesForRetransmission(p)
@@ -1165,7 +1208,7 @@ func (h *sentPacketHandler) queueFramesForRetransmission(p *packet) {
 func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 	h.bytesInFlight = 0
 	var firstPacketSendTime monotime.Time
-
+	// Only Initial and 0-RTT packets can have been sent before a Retry.
 	for _, p := range h.hist.Packets() {
 		if p.EncryptionLevel == protocol.EncryptionInitial && firstPacketSendTime.IsZero() {
 			firstPacketSendTime = p.SendTime
@@ -1175,8 +1218,10 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 		}
 	}
 
+	// Only use the Retry to estimate the RTT if we didn't send any retransmission for the Initial.
+	// Otherwise, we don't know which Initial the Retry was sent in response to.
 	if h.ptoCount == 0 {
-
+		// Don't set the RTT to a value lower than 5ms here.
 		h.rttStats.UpdateRTT(max(minRTTAfterRetry, now.Sub(firstPacketSendTime)), 0)
 		if h.logger.Debug() {
 			h.logger.Debugf("\tupdated RTT: %s (σ: %s)", h.rttStats.SmoothedRTT(), h.rttStats.MeanDeviation())
