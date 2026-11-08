@@ -255,10 +255,6 @@ func (b *bbrSender) updateConnectionStats() {
 func (b *bbrSender) OnCongestionEvent(packetNumber protocol.PacketNumber, lostBytes protocol.ByteCount, priorInFlight protocol.ByteCount) {
 	if lostBytes > 0 {
 		b.packetsLost = append(b.packetsLost, packetNumber)
-		if b.connStats != nil {
-			b.connStats.PacketsLost.Add(1)
-			b.connStats.BytesLost.Add(uint64(lostBytes))
-		}
 	}
 }
 

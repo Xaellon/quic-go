@@ -1316,6 +1316,7 @@ func TestSentPacketHandler0RTT(t *testing.T) {
 func TestSentPacketHandlerCongestion(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	cong := mocks.NewMockSendAlgorithmWithDebugInfos(mockCtrl)
+	cong.EXPECT().GetCongestionWindow().AnyTimes()
 	rttStats := utils.NewRTTStats()
 	sph := NewSentPacketHandler(
 		0,
@@ -1512,6 +1513,7 @@ func TestSentPacketHandlerRetryAfterPTO(t *testing.T) {
 func TestSentPacketHandlerECN(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	cong := mocks.NewMockSendAlgorithmWithDebugInfos(mockCtrl)
+	cong.EXPECT().GetCongestionWindow().AnyTimes()
 	cong.EXPECT().OnPacketSent(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
 	cong.EXPECT().OnPacketAcked(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
 	cong.EXPECT().MaybeExitSlowStart().AnyTimes()
@@ -1627,6 +1629,11 @@ func TestSentPacketHandlerECN(t *testing.T) {
 	)
 	_, err = sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[0])}, protocol.Encryption1RTT, now.Add(100*time.Millisecond))
 	require.NoError(t, err)
+
+	// Packets declared lost for a PTO probe are reported to the ECN handler.
+	pn = sendPacket(t, now, protocol.ECT0)
+	ecnHandler.EXPECT().LostPacket(pn)
+	require.True(t, sph.QueueProbePacket(protocol.PacketNumberSpaceAppData))
 }
 
 func TestSentPacketHandlerPathProbe(t *testing.T) {
@@ -1904,6 +1911,8 @@ func TestSentPacketHandlerSpuriousLoss(t *testing.T) {
 	// pns[4] and pns[5] are not yet declared lost
 	require.Equal(t, []protocol.PacketNumber{pns[1], pns[2], pns[3]}, packets.Lost)
 	require.Less(t, connStats.CongestionWindow.Load(), window)
+	require.Equal(t, int64(3), connStats.PacketsLost.Load())
+	require.Equal(t, int64(3000), connStats.BytesLost.Load())
 
 	packets.Reset()
 	eventRecorder.Clear()
@@ -1920,6 +1929,8 @@ func TestSentPacketHandlerSpuriousLoss(t *testing.T) {
 	require.Equal(t, []protocol.PacketNumber{pns[4], pns[5], pns[12], pns[16]}, packets.Acked)
 	require.Empty(t, packets.Lost)
 	require.Equal(t, window, connStats.CongestionWindow.Load())
+	require.Zero(t, connStats.PacketsLost.Load())
+	require.Zero(t, connStats.BytesLost.Load())
 	require.Equal(t,
 		[]qlogwriter.Event{
 			qlog.SpuriousLoss{

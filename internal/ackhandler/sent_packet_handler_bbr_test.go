@@ -146,3 +146,34 @@ func TestBBRHandlerDiscardRetryAndMigration(t *testing.T) {
 		t.Fatal("migration lost BBR configuration")
 	}
 }
+
+func TestBBRHandlerSpuriousLossStats(t *testing.T) {
+	h := testBBRHandler(10_000_000).(*bbrPacketHandler)
+	start := monotime.Now()
+	pns := make([]protocol.PacketNumber, 0, 20)
+	for i := range 20 {
+		pn := h.PopPacketNumber(protocol.PacketNumberSpaceAppData)
+		h.SentPacket(start.Add(time.Duration(i)*10*time.Millisecond), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.Encryption1RTT, protocol.ECNNon, 1000, false, false)
+		pns = append(pns, pn)
+	}
+
+	if _, err := h.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[0], pns[6])}, protocol.Encryption1RTT, start.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.connStats.PacketsLost.Load(); got != 3 {
+		t.Fatalf("lost packets counted %d times, want 3", got)
+	}
+	if got := h.connStats.BytesLost.Load(); got != 3000 {
+		t.Fatalf("lost bytes = %d, want 3000", got)
+	}
+
+	if _, err := h.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[:7]...)}, protocol.Encryption1RTT, start.Add(1050*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.connStats.PacketsLost.Load(); got != 0 {
+		t.Fatalf("lost packets after late ACK = %d, want 0", got)
+	}
+	if got := h.connStats.BytesLost.Load(); got != 0 {
+		t.Fatalf("lost bytes after late ACK = %d, want 0", got)
+	}
+}

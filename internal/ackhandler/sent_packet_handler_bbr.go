@@ -62,7 +62,7 @@ func (h *sentPacketHandler) resetCongestionController(size protocol.ByteCount) {
 		h.congestion = &bbrSendAdapter{congestion.NewBbrSender(h.rttStats, size, h.maxPacingRate, func() protocol.ByteCount { return h.bytesInFlight }, h.connStats)}
 		return
 	}
-	h.congestion = congestion.NewCubicSender(congestion.DefaultClock{}, h.rttStats, h.connStats, size, true, h.qlogger)
+	h.congestion = congestion.NewCubicSender(congestion.DefaultClock{}, h.rttStats, size, true, h.qlogger)
 }
 
 func (h *bbrPacketHandler) controller() bbrController {

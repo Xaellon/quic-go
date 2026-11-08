@@ -6,6 +6,7 @@ import (
 	"github.com/quic-go/quic-go/internal/handshake"
 	"github.com/quic-go/quic-go/internal/monotime"
 	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/udp"
 	"go.uber.org/mock/gomock"
 )
 
@@ -26,7 +27,7 @@ func TestPacketPackerBBRApplicationLimited(t *testing.T) {
 		tp.sealingManager.EXPECT().Get1RTTSealer().Return(newMockShortHeaderSealer(ctrl), nil)
 		tp.ackFramer.EXPECT().GetAckFrame(protocol.Encryption1RTT, gomock.Any(), true)
 		tp.framer.EXPECT().HasData().Times(2)
-		buf := getPacketBuffer()
+		buf := udp.GetPacketBuffer()
 		defer buf.Release()
 		_, err := tp.packer.AppendPacket(buf, 1280, monotime.Now(), protocol.Version1)
 		if err != errNothingToPack || pn.limited != 1 {

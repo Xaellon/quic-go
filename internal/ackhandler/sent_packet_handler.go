@@ -197,6 +197,7 @@ func newSentPacketHandler(
 		h.enableECN = true
 		h.ecnTracker = newECNTracker(logger, qlogger)
 	}
+	h.connStats.CongestionWindow.Store(uint64(h.congestion.GetCongestionWindow()))
 	h.qlogRecoveryParametersSet(true)
 	return h
 }
@@ -435,6 +436,12 @@ func (h *sentPacketHandler) getPacketNumberSpace(space protocol.PacketNumberSpac
 }
 
 func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.EncryptionLevel, rcvTime monotime.Time) (bool /* contained 1-RTT packet */, error) {
+	acked1RTTPacket, err := h.receivedAck(ack, encLevel, rcvTime)
+	h.connStats.CongestionWindow.Store(uint64(h.congestion.GetCongestionWindow()))
+	return acked1RTTPacket, err
+}
+
+func (h *sentPacketHandler) receivedAck(ack *wire.AckFrame, encLevel protocol.EncryptionLevel, rcvTime monotime.Time) (bool, error) {
 	pnSpace := h.getPacketNumberSpace(encLevel.PacketNumberSpace())
 
 	largestAcked := ack.LargestAcked()
@@ -604,7 +611,9 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 		}
 	}
 	for _, pn := range spuriousLosses {
-		h.lostPackets.Delete(pn)
+		length := h.lostPackets.Delete(pn)
+		h.connStats.PacketsLost.Add(-1)
+		h.connStats.BytesLost.Add(-int64(length))
 	}
 	lossDelay := max(
 		max(h.rttStats.LatestRTT(), h.rttStats.SmoothedRTT())*time.Duration(8+h.timeThresholdEighths)/8,
@@ -981,7 +990,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 		}
 		if packetLost {
 			if p.Outstanding() && space == protocol.PacketNumberSpaceAppData {
-				h.lostPackets.Add(pn, p.SendTime)
+				h.lostPackets.Add(pn, p.SendTime, p.Length)
 			}
 			h.hist.DeclareLost(pn)
 			if !p.isPathProbePacket && p.IsAckEliciting() {
@@ -989,6 +998,8 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 				h.removeFromBytesInFlight(p)
 				h.queueFramesForRetransmission(p)
 				if !p.IsPathMTUProbePacket {
+					h.connStats.PacketsLost.Add(1)
+					h.connStats.BytesLost.Add(int64(p.Length))
 					h.congestion.OnCongestionEvent(pn, p.Length, priorInFlight)
 				}
 				if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
@@ -1027,6 +1038,7 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 		}
 		// Early retransmit or time loss detection
 		h.detectLostPackets(now, encLevel)
+		h.connStats.CongestionWindow.Store(uint64(h.congestion.GetCongestionWindow()))
 		return nil
 	}
 
@@ -1164,6 +1176,7 @@ func (h *sentPacketHandler) TimeUntilSend() monotime.Time {
 
 func (h *sentPacketHandler) SetMaxDatagramSize(s protocol.ByteCount) {
 	h.congestion.SetMaxDatagramSize(s)
+	h.connStats.CongestionWindow.Store(uint64(h.congestion.GetCongestionWindow()))
 }
 
 func (h *sentPacketHandler) isAmplificationLimited() bool {
@@ -1184,6 +1197,9 @@ func (h *sentPacketHandler) QueueProbePacket(space protocol.PacketNumberSpace) b
 	h.hist.DeclareLost(pn)
 	h.removeFromBytesInFlight(p)
 	h.queueFramesForRetransmission(p)
+	if p.EncryptionLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
+		h.ecnTracker.LostPacket(pn)
+	}
 	return true
 }
 
@@ -1271,6 +1287,7 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 		h.hist.RemovePathProbe(pn)
 	}
 	h.resetCongestionController(initialMaxDatagramSize)
+	h.connStats.CongestionWindow.Store(uint64(h.congestion.GetCongestionWindow()))
 	h.qlogRecoveryParametersSet(true)
 	h.setLossDetectionTimer(now)
 }
