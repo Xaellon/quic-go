@@ -20,15 +20,17 @@ func newTestBBR(rate Bandwidth) (*bbrSender, *protocol.ByteCount) {
 func TestBBRSamplingAndReordering(t *testing.T) {
 	b, inflight := newTestBBR(1000)
 	now := monotime.Now()
-	b.OnPacketSent(now, 0, 1, 1280, true)
-	b.OnPacketSent(now.Add(time.Millisecond), 1280, 2, 1280, true)
+	*inflight = 1280
+	b.OnPacketSent(now, 1, 1280, true)
+	*inflight += 1280
+	b.OnPacketSent(now.Add(time.Millisecond), 2, 1280, true)
 	if got := b.sampler.connectionStateMap.GetEntry(1).sendTimeState.bytesInFlight; got != 1280 {
 		t.Fatalf("inflight=%d", got)
 	}
 	for i, pn := range []protocol.PacketNumber{2, 1} {
 		*inflight = protocol.ByteCount(1-i) * 1280
 		at := now.Add(time.Duration(100+i) * time.Millisecond)
-		b.OnPacketAcked(pn, 1280, *inflight+1280, at)
+		b.OnPacketAcked(pn, *inflight+1280)
 		b.OnAcksEnd(*inflight+1280, at)
 	}
 	if b.sampler.TotalBytesAcked() != 2560 || !b.sampler.connectionStateMap.IsEmpty() || b.minRtt == 0 {
@@ -40,9 +42,10 @@ func TestBBRSamplingAndReordering(t *testing.T) {
 }
 
 func TestBBRApplicationLimitedAndIdle(t *testing.T) {
-	b, _ := newTestBBR(1_000_000)
+	b, inflight := newTestBBR(1_000_000)
 	b.OnApplicationLimited(0)
-	b.OnPacketSent(monotime.Now(), 0, 1, 1280, true)
+	*inflight = 1280
+	b.OnPacketSent(monotime.Now(), 1, 1280, true)
 	if !b.sampler.IsAppLimited() || !b.exitingQuiescence {
 		t.Fatal("missing application-limit or idle-exit state")
 	}
@@ -79,8 +82,9 @@ func TestBBRLossOnlyRecovery(t *testing.T) {
 	b.isAtFullBandwidth = true
 	b.mode = bbrModeProbeBw
 	now := monotime.Now()
-	b.OnPacketSent(now, 0, 1, 1280, true)
-	b.OnCongestionEvent(1, 1280, 1280)
+	*inflight = 1280
+	b.OnPacketSent(now, 1, 1280, true)
+	b.OnCongestionEvent(1)
 	*inflight = 0
 	b.OnAcksEnd(1280, now.Add(100*time.Millisecond))
 	if !b.InRecovery() || b.sampler.TotalBytesLost() != 1280 || !b.sampler.connectionStateMap.IsEmpty() {
@@ -190,8 +194,9 @@ func TestBBRStartupLossDoesNotCountAsRound(t *testing.T) {
 	b.bandwidthAtLastRound = 1_000_000
 	now := monotime.Now()
 	for pn := protocol.PacketNumber(1); pn <= 8; pn++ {
-		b.OnPacketSent(now, 0, pn, 1280, true)
-		b.OnCongestionEvent(pn, 1280, 1280)
+		*inflight = 1280
+		b.OnPacketSent(now, pn, 1280, true)
+		b.OnCongestionEvent(pn)
 		*inflight = 0
 		b.OnAcksEnd(1280, now.Add(time.Millisecond))
 	}
@@ -296,11 +301,13 @@ func TestBBRStartupPacingLimitRequiresDelivery(t *testing.T) {
 			}
 		})
 	}
-	b, _ := newTestBBR(1_000_000)
+	b, inflight := newTestBBR(1_000_000)
 	b.OnApplicationLimited(0)
 	now := monotime.Now()
-	b.OnPacketSent(now, 0, 1, 1280, true)
-	b.OnPacketAcked(1, 1280, 1280, now.Add(time.Millisecond))
+	*inflight = 1280
+	b.OnPacketSent(now, 1, 1280, true)
+	b.OnPacketAcked(1, 1280)
+	*inflight = 0
 	b.OnAcksEnd(1280, now.Add(time.Millisecond))
 	if !b.lastSampleIsAppLimited || b.isAtFullBandwidth {
 		t.Fatal("a fast ACK cleared the application-limited state")
@@ -357,11 +364,11 @@ func TestBBRProbeRTTLifecycle(t *testing.T) {
 		pn := protocol.PacketNumber(0)
 		sendAndAck := func(sent monotime.Time) monotime.Time {
 			pn++
-			b.OnPacketSent(sent, *inflight, pn, 1280, true)
 			*inflight += 1280
+			b.OnPacketSent(sent, pn, 1280, true)
 			prior := *inflight
 			at := sent.Add(50 * time.Millisecond)
-			b.OnPacketAcked(pn, 1280, prior, at)
+			b.OnPacketAcked(pn, prior)
 			*inflight -= 1280
 			b.OnAcksEnd(prior, at)
 			return at

@@ -92,9 +92,8 @@ type bbrSender struct {
 }
 
 var (
-	_ SendAlgorithm               = &bbrSender{}
-	_ SendAlgorithmWithDebugInfos = &bbrSender{}
-	_ HandleAggregatedAcks        = &bbrSender{}
+	_ SendAlgorithm        = &bbrSender{}
+	_ HandleAggregatedAcks = &bbrSender{}
 )
 
 func NewBbrSender(
@@ -129,7 +128,7 @@ func NewBbrSender(
 	return b
 }
 
-func (b *bbrSender) TimeUntilSend(bytesInFlight protocol.ByteCount) monotime.Time {
+func (b *bbrSender) TimeUntilSend() monotime.Time {
 	return b.pacer.TimeUntilSend(b.pacingRate())
 }
 
@@ -147,7 +146,12 @@ func (b *bbrSender) pacingRate() Bandwidth {
 	return min(b.maxPacingRate, rate)
 }
 
-func (b *bbrSender) OnPacketSent(sentTime monotime.Time, bytesInFlight protocol.ByteCount, packetNumber protocol.PacketNumber, bytesSent protocol.ByteCount, isRetransmittable bool) {
+func (b *bbrSender) OnPacketSent(sentTime monotime.Time, packetNumber protocol.PacketNumber, bytesSent protocol.ByteCount, isRetransmittable bool) {
+	bytesInFlight := b.bytesInFlight()
+	if isRetransmittable {
+		// The packet handler has already added this packet to bytes in flight.
+		bytesInFlight -= bytesSent
+	}
 	rate := b.pacingRate()
 	b.pacer.SentPacket(sentTime, bytesSent, rate)
 	if isRetransmittable && b.mode == bbrModeStartup {
@@ -168,7 +172,7 @@ func (b *bbrSender) CanSend(bytesInFlight protocol.ByteCount) bool {
 
 func (b *bbrSender) MaybeExitSlowStart() {}
 
-func (b *bbrSender) OnPacketAcked(packetNumber protocol.PacketNumber, ackedBytes protocol.ByteCount, priorInFlight protocol.ByteCount, eventTime monotime.Time) {
+func (b *bbrSender) OnPacketAcked(packetNumber protocol.PacketNumber, _ protocol.ByteCount) {
 	b.packetsAcked = append(b.packetsAcked, packetNumber)
 }
 
@@ -252,13 +256,10 @@ func (b *bbrSender) updateConnectionStats() {
 	}
 }
 
-func (b *bbrSender) OnCongestionEvent(packetNumber protocol.PacketNumber, lostBytes protocol.ByteCount, priorInFlight protocol.ByteCount) {
-	if lostBytes > 0 {
-		b.packetsLost = append(b.packetsLost, packetNumber)
-	}
+func (b *bbrSender) OnCongestionEvent(packetNumber protocol.PacketNumber) {
+	// BBR connections disable ECN, so this callback reports a packet loss.
+	b.packetsLost = append(b.packetsLost, packetNumber)
 }
-
-func (b *bbrSender) OnRetransmissionTimeout(packetsRetransmitted bool) {}
 
 func (b *bbrSender) OnSpuriousLoss(protocol.PacketNumber) {}
 

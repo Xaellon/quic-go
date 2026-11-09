@@ -10,22 +10,11 @@ import (
 )
 
 type bbrController interface {
-	congestion.SendAlgorithmWithDebugInfos
+	congestion.SendAlgorithm
 	congestion.HandleAggregatedAcks
 	OnApplicationLimited(protocol.ByteCount)
 	OnPacketNeutered(protocol.PacketNumber)
 	RemoveObsoletePackets(protocol.PacketNumber)
-}
-
-type bbrSendAdapter struct {
-	bbrController
-}
-
-func (a *bbrSendAdapter) OnPacketSent(now monotime.Time, inflight protocol.ByteCount, pn protocol.PacketNumber, size protocol.ByteCount, ackEliciting bool) {
-	if ackEliciting {
-		inflight -= size
-	}
-	a.bbrController.OnPacketSent(now, inflight, pn, size, ackEliciting)
 }
 
 type bbrPacketHandler struct {
@@ -59,10 +48,10 @@ func (h *sentPacketHandler) resetCongestionController(size protocol.ByteCount) {
 	if h.maxPacingRate > 0 {
 		h.enableECN = false
 		h.ecnTracker = nil
-		h.congestion = &bbrSendAdapter{congestion.NewBbrSender(h.rttStats, size, h.maxPacingRate, func() protocol.ByteCount { return h.bytesInFlight }, h.connStats)}
+		h.congestion = congestion.NewBbrSender(h.rttStats, size, h.maxPacingRate, func() protocol.ByteCount { return h.bytesInFlight }, h.connStats)
 		return
 	}
-	h.congestion = congestion.NewCubicSender(congestion.DefaultClock{}, h.rttStats, size, true, h.qlogger)
+	h.congestion = congestion.NewRenoSender(h.rttStats, size, h.qlogger)
 }
 
 func (h *bbrPacketHandler) controller() bbrController {

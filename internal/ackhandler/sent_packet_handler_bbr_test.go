@@ -13,16 +13,8 @@ import (
 
 type recordedBBR struct {
 	bbrController
-	inflight protocol.ByteCount
 	flushes  int
 	neutered []protocol.PacketNumber
-}
-
-func (r *recordedBBR) OnPacketSent(now monotime.Time, inflight protocol.ByteCount, pn protocol.PacketNumber, size protocol.ByteCount, ack bool) {
-	r.inflight = inflight
-	if r.bbrController != nil {
-		r.bbrController.OnPacketSent(now, inflight, pn, size, ack)
-	}
 }
 
 func (r *recordedBBR) OnAcksEnd(prior protocol.ByteCount, now monotime.Time) {
@@ -52,12 +44,6 @@ func TestBBRSelectionAndECN(t *testing.T) {
 	h := testBBRHandler(1_000_000).(*bbrPacketHandler)
 	if h.enableECN || h.ecnTracker != nil || h.ECNMode(true) != protocol.ECNUnsupported {
 		t.Fatal("BBRv1 advertised unsupported ECN behavior")
-	}
-	r := &recordedBBR{}
-	a := &bbrSendAdapter{r}
-	a.OnPacketSent(monotime.Now(), 1280, 1, 1280, true)
-	if r.inflight != 0 {
-		t.Fatal("post-send inflight was not translated")
 	}
 }
 
@@ -142,6 +128,9 @@ func TestBBRHandlerDiscardRetryAndMigration(t *testing.T) {
 		t.Fatal("Retry retained BBR state")
 	}
 	h.MigratedPath(now, 1200)
+	if _, ok := h.congestion.(bbrController); !ok {
+		t.Fatal("migration did not rebuild the BBR controller")
+	}
 	if h.maxPacingRate != 1_000_000 || h.congestion.GetCongestionWindow() != 32*1200 || h.enableECN {
 		t.Fatal("migration lost BBR configuration")
 	}
