@@ -358,7 +358,7 @@ func (h *sentPacketHandler) SentPacket(
 	h.congestion.OnPacketSent(t, pn, size, isAckEliciting)
 
 	if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
-		h.ecnTracker.SentPacket(pn, ecn)
+		h.ecnTracker.SentPacket(t, pn, ecn)
 	}
 
 	if p.Outstanding() {
@@ -1265,6 +1265,8 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 }
 
 func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSize protocol.ByteCount) {
+	// Packets sent on the old path are expected to have arrived within 3 PTOs of the old path.
+	oldPathDrainTime := now.Add(3 * h.rttStats.PTO(true))
 	h.rttStats.ResetForPathMigration()
 	h.lastMetrics = qlog.MetricsUpdated{}
 	h.packetThresholdDisabled = false
@@ -1288,6 +1290,9 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 	}
 	h.resetCongestionController(initialMaxDatagramSize)
 	h.connStats.CongestionWindow.Store(uint64(h.congestion.GetCongestionWindow()))
+	if h.ecnTracker != nil {
+		h.ecnTracker.MigratedPath(oldPathDrainTime)
+	}
 	h.qlogRecoveryParametersSet(true)
 	h.setLossDetectionTimer(now)
 }

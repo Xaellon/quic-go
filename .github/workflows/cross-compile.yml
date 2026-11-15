@@ -1,4 +1,7 @@
-on: [push, pull_request]
+on:
+  push:
+    branches: [ master, "release-*" ]
+  pull_request:
 
 permissions: read-all
 
@@ -26,6 +29,7 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
           check-latest: true
+          cache: false
       - uses: ./.github/actions/go-cache-restore
         id: go-cache
         with:
