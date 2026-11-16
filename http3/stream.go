@@ -92,6 +92,7 @@ func (s *Stream) Read(b []byte) (int, error) {
 			switch f := frame.(type) {
 			case *dataFrame:
 				if s.parsedTrailer {
+					s.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "")
 					return 0, errors.New("DATA frame received after trailers")
 				}
 				s.bytesRemainingInFrame = f.Length
@@ -99,6 +100,7 @@ func (s *Stream) Read(b []byte) (int, error) {
 			case *headersFrame:
 				if s.parsedTrailer {
 					maybeQlogInvalidHeadersFrame(s.qlogger, s.StreamID(), f.Length)
+					s.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "")
 					return 0, errors.New("additional HEADERS frame received after trailers")
 				}
 				s.parsedTrailer = true
@@ -531,8 +533,9 @@ func (s *RequestStream) ReadResponse() (*http.Response, error) {
 		contentLength = 0
 	}
 	// A successful CONNECT response starts a tunnel, even if it's a 204.
+	// Its Content-Length must be ignored, see section 9.3.6 of RFC 9110.
 	if isSuccessfulConnect {
-		contentLength = res.ContentLength
+		contentLength = -1
 	}
 	respBody := newResponseBody(s.str, contentLength, s.reqDone)
 

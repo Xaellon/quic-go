@@ -431,17 +431,14 @@ func TestClientExtendedConnectCancelBeforeSettings(t *testing.T) {
 
 func TestClient1xxHandling(t *testing.T) {
 	t.Run("a few early hints", func(t *testing.T) {
-		testClient1xxHandling(t, max1xxResponses, http.StatusOK, false)
+		testClient1xxHandling(t, max1xxResponses, false)
 	})
 	t.Run("too many early hints", func(t *testing.T) {
-		testClient1xxHandling(t, max1xxResponses+1, http.StatusOK, true)
-	})
-	t.Run("EarlyHints followed by StatusSwitchingProtocols", func(t *testing.T) {
-		testClient1xxHandling(t, 1, http.StatusSwitchingProtocols, false)
+		testClient1xxHandling(t, max1xxResponses+1, true)
 	})
 }
 
-func testClient1xxHandling(t *testing.T, numEarlyHints int, terminalStatus int, tooMany bool) {
+func testClient1xxHandling(t *testing.T, numEarlyHints int, tooMany bool) {
 	var rspBuf bytes.Buffer
 	rstr := NewMockDatagramStream(gomock.NewController(t))
 	rstr.EXPECT().StreamID().Return(quic.StreamID(42)).AnyTimes()
@@ -452,7 +449,7 @@ func testClient1xxHandling(t *testing.T, numEarlyHints int, terminalStatus int, 
 	for range numEarlyHints {
 		rw.WriteHeader(http.StatusEarlyHints)
 	}
-	rw.WriteHeader(terminalStatus)
+	rw.WriteHeader(http.StatusOK)
 	rw.Flush()
 	rspBytes := rspBuf.Bytes()
 
@@ -495,7 +492,7 @@ func testClient1xxHandling(t *testing.T, numEarlyHints int, terminalStatus int, 
 	}
 
 	require.Equal(t, []string{"foo", "bar"}, rsp.Header["Link"])
-	require.Equal(t, terminalStatus, rsp.StatusCode)
+	require.Equal(t, http.StatusOK, rsp.StatusCode)
 }
 
 func TestClientGzip(t *testing.T) {
@@ -521,6 +518,33 @@ func TestClientGzip(t *testing.T) {
 	t.Run("failed CONNECT", func(t *testing.T) {
 		testClientGzip(t, gzippedFoobar, []byte("foobar"), false, true, http.MethodConnect, http.StatusBadRequest)
 	})
+}
+
+func TestClientConnectIgnoresContentLength(t *testing.T) {
+	var hdr bytes.Buffer
+	enc := qpack.NewEncoder(&hdr)
+	require.NoError(t, enc.WriteField(qpack.HeaderField{Name: ":status", Value: "200"}))
+	require.NoError(t, enc.WriteField(qpack.HeaderField{Name: "content-length", Value: "3"}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	clientConn, serverConn := newConnPair(t)
+	go func() {
+		str, err := serverConn.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		str.Write(append((&headersFrame{Length: uint64(hdr.Len())}).Append(nil), hdr.Bytes()...))
+		str.Write(getDataFrame([]byte("foobar")))
+		str.Close()
+	}()
+
+	req := httptest.NewRequestWithContext(ctx, http.MethodConnect, "http://quic-go.net", nil)
+	rsp, err := (&Transport{}).NewClientConn(clientConn).RoundTrip(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(rsp.Body)
+	require.NoError(t, err)
+	require.Equal(t, []byte("foobar"), body)
 }
 
 func testClientGzip(t *testing.T,

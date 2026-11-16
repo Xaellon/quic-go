@@ -126,6 +126,7 @@ func TestRequestHeaderParsingWithHostHeader(t *testing.T) {
 func TestRequestHeadersContentLength(t *testing.T) {
 	t.Run("no content length", func(t *testing.T) {
 		headers := []qpack.HeaderField{
+			{Name: ":scheme", Value: "https"},
 			{Name: ":path", Value: "/"},
 			{Name: ":authority", Value: "quic-go.net"},
 			{Name: ":method", Value: http.MethodGet},
@@ -137,6 +138,7 @@ func TestRequestHeadersContentLength(t *testing.T) {
 
 	t.Run("multiple content lengths", func(t *testing.T) {
 		headers := []qpack.HeaderField{
+			{Name: ":scheme", Value: "https"},
 			{Name: ":path", Value: "/"},
 			{Name: ":authority", Value: "quic-go.net"},
 			{Name: ":method", Value: http.MethodGet},
@@ -419,6 +421,35 @@ func TestRequestHeadersValidation(t *testing.T) {
 			},
 			err: "userinfo is not allowed in :authority",
 		},
+		{
+			name: "invalid :authority",
+			headers: []qpack.HeaderField{
+				{Name: ":scheme", Value: "https"},
+				{Name: ":path", Value: "/foo"},
+				{Name: ":authority", Value: "quic-go.net/foo"},
+				{Name: ":method", Value: http.MethodGet},
+			},
+			err: `invalid :authority: "quic-go.net/foo"`,
+		},
+		{
+			name: "missing :scheme",
+			headers: []qpack.HeaderField{
+				{Name: ":path", Value: "/foo"},
+				{Name: ":authority", Value: "user@quic-go.net"},
+				{Name: ":method", Value: http.MethodGet},
+			},
+			err: `invalid :scheme: ""`,
+		},
+		{
+			name: "non-HTTP :scheme",
+			headers: []qpack.HeaderField{
+				{Name: ":scheme", Value: "ftp"},
+				{Name: ":path", Value: "/foo"},
+				{Name: ":authority", Value: "user@quic-go.net"},
+				{Name: ":method", Value: http.MethodGet},
+			},
+			err: `invalid :scheme: "ftp"`,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := requestFromHeaders(decodeFromSlice(tc.headers), math.MaxInt, nil)
@@ -435,6 +466,7 @@ func TestRequestHeadersValidation(t *testing.T) {
 
 func TestCookieHeader(t *testing.T) {
 	headers := []qpack.HeaderField{
+		{Name: ":scheme", Value: "https"},
 		{Name: ":path", Value: "/foo"},
 		{Name: ":authority", Value: "quic-go.net"},
 		{Name: ":method", Value: http.MethodGet},
@@ -450,6 +482,7 @@ func TestCookieHeader(t *testing.T) {
 
 func TestHeadersConcatenation(t *testing.T) {
 	headers := []qpack.HeaderField{
+		{Name: ":scheme", Value: "https"},
 		{Name: ":path", Value: "/foo"},
 		{Name: ":authority", Value: "quic-go.net"},
 		{Name: ":method", Value: http.MethodGet},
@@ -603,10 +636,9 @@ func TestResponseHeaderParsing(t *testing.T) {
 
 func TestResponseHeaderParsingValidation(t *testing.T) {
 	for _, tc := range []struct {
-		name        string
-		headers     []qpack.HeaderField
-		err         string
-		errContains string
+		name    string
+		headers []qpack.HeaderField
+		err     string
 	}{
 		{
 			name: "missing :status",
@@ -614,13 +646,6 @@ func TestResponseHeaderParsingValidation(t *testing.T) {
 				{Name: "content-length", Value: "42"},
 			},
 			err: "missing :status field",
-		},
-		{
-			name: "invalid status code",
-			headers: []qpack.HeaderField{
-				{Name: ":status", Value: "foobar"},
-			},
-			errContains: "invalid status code",
 		},
 		{
 			name: ":method header field", // :method is a request pseudo header
@@ -640,12 +665,15 @@ func TestResponseHeaderParsingValidation(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := updateResponseFromHeaders(&http.Response{}, decodeFromSlice(tc.headers), math.MaxInt, nil)
-			if tc.errContains != "" {
-				require.ErrorContains(t, err, tc.errContains)
-			}
-			if tc.err != "" {
-				require.EqualError(t, err, tc.err)
-			}
+			require.EqualError(t, err, tc.err)
+		})
+	}
+
+	for _, status := range []string{"foobar", "+200", "0200", "-1", "99", "600"} {
+		t.Run("invalid status code "+status, func(t *testing.T) {
+			headers := []qpack.HeaderField{{Name: ":status", Value: status}}
+			err := updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil)
+			require.EqualError(t, err, fmt.Sprintf("invalid status code: %q", status))
 		})
 	}
 
@@ -825,6 +853,7 @@ func TestQpackError(t *testing.T) {
 }
 
 var benchmarkRequestHeaders = []qpack.HeaderField{
+	{Name: ":scheme", Value: "https"},
 	{Name: ":path", Value: "/api/v1/users/12345"},
 	{Name: ":authority", Value: "quic-go.net"},
 	{Name: ":method", Value: http.MethodPost},

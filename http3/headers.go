@@ -334,6 +334,16 @@ func requestFromHeaders(decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *
 	if (!isConnect || isExtendedConnected) && !validPath {
 		return nil, fmt.Errorf("invalid :path: %q", hdr.Path)
 	}
+	// Like net/http's HTTP/2 server, only accept http and https for regular requests.
+	// This also rejects a missing :scheme, see section 4.3.1 of RFC 9114.
+	if !isConnect && hdr.Scheme != "http" && hdr.Scheme != "https" {
+		return nil, fmt.Errorf("invalid :scheme: %q", hdr.Scheme)
+	}
+	// Reject bytes that can't appear in a host and port, see section 4.3.1 of RFC 9114.
+	// Like net/http, we don't validate the host and port syntax, see https://github.com/golang/go/issues/78172.
+	if !httpguts.ValidHostHeader(hdr.Authority) {
+		return nil, fmt.Errorf("invalid :authority: %q", hdr.Authority)
+	}
 
 	var u *url.URL
 	var requestURI string
@@ -400,9 +410,10 @@ func updateResponseFromHeaders(rsp *http.Response, decodeFn qpack.DecodeFunc, si
 	rsp.Trailer = extractAnnouncedTrailers(rsp.Header)
 	rsp.ContentLength = hdr.ContentLength
 
+	// Status codes have three digits and range from 100 to 599, see section 15 of RFC 9110.
 	status, err := strconv.Atoi(hdr.Status)
-	if err != nil {
-		return fmt.Errorf("invalid status code: %w", err)
+	if err != nil || len(hdr.Status) != 3 || status < 100 || status > 599 {
+		return fmt.Errorf("invalid status code: %q", hdr.Status)
 	}
 	rsp.StatusCode = status
 	rsp.Status = hdr.Status + " " + http.StatusText(status)
