@@ -396,7 +396,7 @@ func TestFrameAllowedAtEncLevel(t *testing.T) {
 			frame:            &ConnectionCloseFrame{IsApplicationError: false, ReasonPhrase: "err"},
 			allowedInitial:   true,
 			allowedHandshake: true,
-			allowedZeroRTT:   false,
+			allowedZeroRTT:   true,
 			allowedOneRTT:    true,
 		},
 		{
@@ -430,6 +430,15 @@ func TestFrameAllowedAtEncLevel(t *testing.T) {
 			name:             "RETIRE_CONNECTION_ID_FRAME",
 			frameType:        FrameTypeRetireConnectionID,
 			frame:            &RetireConnectionIDFrame{SequenceNumber: 1},
+			allowedInitial:   false,
+			allowedHandshake: false,
+			allowedZeroRTT:   false,
+			allowedOneRTT:    true,
+		},
+		{
+			name:             "HANDSHAKE_DONE_FRAME",
+			frameType:        FrameTypeHandshakeDone,
+			frame:            &HandshakeDoneFrame{},
 			allowedInitial:   false,
 			allowedHandshake: false,
 			allowedZeroRTT:   false,
@@ -492,7 +501,7 @@ func TestFrameAllowedAtEncLevel(t *testing.T) {
 				} else {
 					var transportErr *qerr.TransportError
 					require.ErrorAs(t, err, &transportErr)
-					require.Equal(t, qerr.FrameEncodingError, transportErr.ErrorCode)
+					require.Equal(t, qerr.ProtocolViolation, transportErr.ErrorCode)
 				}
 			})
 		}
@@ -578,6 +587,13 @@ func TestFrameParserInvalidFrameType(t *testing.T) {
 	var transportErr *qerr.TransportError
 	require.ErrorAs(t, err, &transportErr)
 	require.Equal(t, qerr.FrameEncodingError, transportErr.ErrorCode)
+}
+
+func TestFrameParserNonMinimalFrameType(t *testing.T) {
+	parser := NewFrameParser(true, true, true)
+	_, l, err := parser.ParseType(quicvarint.AppendWithLen(nil, uint64(FrameTypePing), 2), protocol.Encryption1RTT)
+	require.Equal(t, 2, l)
+	require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.ProtocolViolation, FrameType: uint64(FrameTypePing)})
 }
 
 func TestFrameParsingErrorsOnInvalidFrames(t *testing.T) {

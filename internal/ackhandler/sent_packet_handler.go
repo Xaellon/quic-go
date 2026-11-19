@@ -993,7 +993,10 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 				h.lostPackets.Add(pn, p.SendTime, p.Length)
 			}
 			h.hist.DeclareLost(pn)
-			if !p.isPathProbePacket && p.IsAckEliciting() {
+			if p.isPathProbePacket {
+				continue
+			}
+			if p.IsAckEliciting() {
 				// the bytes in flight need to be reduced no matter if the frames in this packet will be retransmitted
 				h.removeFromBytesInFlight(p)
 				h.queueFramesForRetransmission(p)
@@ -1002,9 +1005,10 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 					h.connStats.BytesLost.Add(int64(p.Length))
 					h.congestion.OnCongestionEvent(pn)
 				}
-				if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
-					h.ecnTracker.LostPacket(pn)
-				}
+			}
+			// ECN validation fails if all ECN-marked packets are lost, including ACK-only packets.
+			if p.EncryptionLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
+				h.ecnTracker.LostPacket(pn)
 			}
 		}
 	}
@@ -1106,7 +1110,8 @@ func (h *sentPacketHandler) ECNMode(isShortHeaderPacket bool) protocol.ECN {
 	if !h.enableECN {
 		return protocol.ECNUnsupported
 	}
-	if !isShortHeaderPacket {
+	// Before handshake confirmation, 1-RTT packets might be coalesced with long header packets.
+	if !isShortHeaderPacket || !h.handshakeConfirmed {
 		return protocol.ECNNon
 	}
 	return h.ecnTracker.Mode()

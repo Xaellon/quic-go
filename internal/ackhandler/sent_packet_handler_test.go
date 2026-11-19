@@ -1526,7 +1526,7 @@ func TestSentPacketHandlerECN(t *testing.T) {
 		rttStats,
 		&utils.ConnectionStats{},
 		true,
-		false,
+		true,
 		nil,
 		protocol.PerspectiveClient,
 		nil,
@@ -1540,6 +1540,12 @@ func TestSentPacketHandlerECN(t *testing.T) {
 	sph.SentPacket(monotime.Now(), sph.PopPacketNumber(protocol.PacketNumberSpaceHandshake), protocol.InvalidPacketNumber, nil, nil, protocol.EncryptionHandshake, protocol.ECT0, 1200, false, false)
 	sph.SentPacket(monotime.Now(), sph.PopPacketNumber(protocol.PacketNumberSpaceAppData), protocol.InvalidPacketNumber, nil, nil, protocol.Encryption0RTT, protocol.ECNCE, 1200, false, false)
 
+	// ECN is only used after handshake confirmation
+	require.Equal(t, protocol.ECNNon, sph.ECNMode(true))
+	sph.DropPackets(protocol.EncryptionHandshake, monotime.Now())
+	ecnHandler.EXPECT().Mode().Return(protocol.ECT1)
+	require.Equal(t, protocol.ECT1, sph.ECNMode(true))
+
 	var packets packetTracker
 	sendPacket := func(t *testing.T, ti monotime.Time, ecn protocol.ECN) protocol.PacketNumber {
 		t.Helper()
@@ -1552,6 +1558,9 @@ func TestSentPacketHandlerECN(t *testing.T) {
 	pns := make([]protocol.PacketNumber, 4)
 	now := monotime.Now()
 	pns[0] = sendPacket(t, now, protocol.ECT1)
+	ackOnly := sph.PopPacketNumber(protocol.PacketNumberSpaceAppData)
+	ecnHandler.EXPECT().SentPacket(now, ackOnly, protocol.ECT1)
+	sph.SentPacket(now, ackOnly, protocol.InvalidPacketNumber, nil, nil, protocol.Encryption1RTT, protocol.ECT1, 100, false, false)
 	now = now.Add(time.Second)
 	pns[1] = sendPacket(t, now, protocol.ECT0)
 	pns[2] = sendPacket(t, now, protocol.ECT0)
@@ -1560,6 +1569,7 @@ func TestSentPacketHandlerECN(t *testing.T) {
 	// Receive an ACK with a short RTT, such that the first packet is lost.
 	cong.EXPECT().OnCongestionEvent(gomock.Any())
 	ecnHandler.EXPECT().LostPacket(pns[0])
+	ecnHandler.EXPECT().LostPacket(ackOnly) // ACK-only packets are reported as lost as well
 	ecnHandler.EXPECT().HandleNewlyAcked(gomock.Any(), int64(10), int64(11), int64(12)).DoAndReturn(func(packets []packetWithPacketNumber, _, _, _ int64) bool {
 		require.Len(t, packets, 2)
 		require.Equal(t, pns[2], packets[0].PacketNumber)
