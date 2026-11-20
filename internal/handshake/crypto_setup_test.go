@@ -18,6 +18,7 @@ import (
 	"github.com/quic-go/quic-go/internal/testdata"
 	"github.com/quic-go/quic-go/internal/utils"
 	"github.com/quic-go/quic-go/internal/wire"
+	"github.com/quic-go/quic-go/quicvarint"
 
 	"github.com/stretchr/testify/require"
 )
@@ -540,6 +541,36 @@ func Test0RTT(t *testing.T) {
 	})
 }
 
+func Test0RTTReducedLimits(t *testing.T) {
+	clientConf, serverConf := getTLSConfigs()
+	csc := newMockClientSessionCache()
+	clientConf.ClientSessionCache = csc
+	clientParams := &wire.TransportParameters{ActiveConnectionIDLimit: 2}
+	serverParams := &wire.TransportParameters{ActiveConnectionIDLimit: 2, InitialMaxData: 1337}
+	_, _, clientErr, _, _, serverErr := handshakeWithTLSConf(
+		t, clientConf, serverConf, utils.NewRTTStats(), utils.NewRTTStats(), clientParams, serverParams, true,
+	)
+	require.NoError(t, clientErr)
+	require.NoError(t, serverErr)
+
+	// make the client remember a higher limit than the server sends on resumption
+	ticket, state, err := (<-csc.puts).ResumptionState()
+	require.NoError(t, err)
+	tp, err := decodeDataFromSessionState(findSessionStateExtraData(state.Extra), true)
+	require.NoError(t, err)
+	tp.InitialMaxData++
+	b := quicvarint.Append(nil, clientSessionStateRevision)
+	state.Extra = [][]byte{addSessionStateExtraPrefix(tp.MarshalForSessionTicket(b))}
+	session, err := tls.NewResumptionState(ticket, state)
+	require.NoError(t, err)
+	csc.cache.Put(clientConf.ServerName, session)
+
+	_, _, clientErr, _, _, _ = handshakeWithTLSConf(
+		t, clientConf, serverConf, utils.NewRTTStats(), utils.NewRTTStats(), clientParams, serverParams, true,
+	)
+	require.ErrorIs(t, clientErr, &qerr.TransportError{ErrorCode: qerr.ProtocolViolation})
+}
+
 func Test0RTTRejectionOnTransportParametersChanged(t *testing.T) {
 	clientConf, serverConf := getTLSConfigs()
 	csc := newMockClientSessionCache()
@@ -589,4 +620,22 @@ func Test0RTTRejectionOnTransportParametersChanged(t *testing.T) {
 	require.True(t, client.ConnectionState().DidResume)
 	require.False(t, server.ConnectionState().Used0RTT)
 	require.False(t, client.ConnectionState().Used0RTT)
+}
+
+func Test0RTTRejectionOnVersionMismatch(t *testing.T) {
+	tp := &wire.TransportParameters{ActiveConnectionIDLimit: 2}
+	server := NewCryptoSetupServer(
+		protocol.ConnectionID{},
+		&net.UDPAddr{IP: net.IPv6loopback, Port: 1234},
+		&net.UDPAddr{IP: net.IPv6loopback, Port: 4321},
+		tp,
+		testdata.GetTLSConfig(),
+		true,
+		utils.NewRTTStats(),
+		nil,
+		utils.DefaultLogger.WithPrefix("server"),
+		protocol.Version1,
+	).(*cryptoSetup)
+	require.True(t, server.handleSessionTicket((&sessionTicket{Version: protocol.Version1, Parameters: tp}).Marshal(), true))
+	require.False(t, server.handleSessionTicket((&sessionTicket{Version: protocol.Version2, Parameters: tp}).Marshal(), true))
 }

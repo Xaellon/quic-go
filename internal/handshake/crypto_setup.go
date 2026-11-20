@@ -246,8 +246,7 @@ func (h *cryptoSetup) handleEvent(ev tls.QUICEvent) (err error) {
 		h.setReadKey(ev.Level, ev.Suite, ev.Data)
 		return nil
 	case tls.QUICSetWriteSecret:
-		h.setWriteKey(ev.Level, ev.Suite, ev.Data)
-		return nil
+		return h.setWriteKey(ev.Level, ev.Suite, ev.Data)
 	case tls.QUICTransportParameters:
 		return h.handleTransportParameters(ev.Data)
 	case tls.QUICTransportParametersRequired:
@@ -368,6 +367,7 @@ func decodeDataFromSessionState(b []byte, earlyData bool) (*wire.TransportParame
 
 func (h *cryptoSetup) getDataForSessionTicket() []byte {
 	return (&sessionTicket{
+		Version:    h.version,
 		Parameters: h.ourParams,
 	}).Marshal()
 }
@@ -414,6 +414,11 @@ func (h *cryptoSetup) handleSessionTicket(data []byte, using0RTT bool) (allowEar
 		return false
 	}
 	if !using0RTT {
+		return false
+	}
+	// Session tickets are specific to the QUIC version of the connection that issued them.
+	if t.Version != h.version {
+		h.logger.Debugf("Session ticket was issued for %s. Rejecting 0-RTT.", t.Version)
 		return false
 	}
 	valid := h.ourParams.ValidFor0RTT(t.Parameters)
@@ -486,7 +491,7 @@ func (h *cryptoSetup) setReadKey(el tls.QUICEncryptionLevel, suiteID uint16, tra
 	}
 }
 
-func (h *cryptoSetup) setWriteKey(el tls.QUICEncryptionLevel, suiteID uint16, trafficSecret []byte) {
+func (h *cryptoSetup) setWriteKey(el tls.QUICEncryptionLevel, suiteID uint16, trafficSecret []byte) error {
 	suite := getCipherSuite(suiteID)
 	//nolint:exhaustive // The TLS stack doesn't export Initial keys.
 	switch el {
@@ -508,7 +513,7 @@ func (h *cryptoSetup) setWriteKey(el tls.QUICEncryptionLevel, suiteID uint16, tr
 			})
 		}
 		// don't set used0RTT here. 0-RTT might still get rejected.
-		return
+		return nil
 	case tls.QUICEncryptionLevelHandshake:
 		h.handshakeSealer = newLongHeaderSealer(
 			createAEAD(suite, trafficSecret, h.version),
@@ -525,6 +530,13 @@ func (h *cryptoSetup) setWriteKey(el tls.QUICEncryptionLevel, suiteID uint16, tr
 		}
 		if h.zeroRTTSealer != nil {
 			// Once we receive handshake keys, we know that 0-RTT was not rejected.
+			// The server must not reduce any of the limits it used for 0-RTT.
+			if !h.peerParams.ValidForUpdate(h.zeroRTTParameters) {
+				return &qerr.TransportError{
+					ErrorCode:    qerr.ProtocolViolation,
+					ErrorMessage: "server sent reduced limits after accepting 0-RTT data",
+				}
+			}
 			h.used0RTT.Store(true)
 			h.zeroRTTSealer = nil
 			h.logger.Debugf("Dropping 0-RTT keys.")
@@ -541,6 +553,7 @@ func (h *cryptoSetup) setWriteKey(el tls.QUICEncryptionLevel, suiteID uint16, tr
 			KeyType: encLevelToKeyType(protocol.FromTLSEncryptionLevel(el), h.perspective),
 		})
 	}
+	return nil
 }
 
 // writeRecord is called when TLS writes data

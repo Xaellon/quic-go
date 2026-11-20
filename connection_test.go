@@ -65,6 +65,7 @@ func connectionOptHandshakeConfirmed() testConnectionOpt {
 	return func(conn *Conn) {
 		conn.handshakeComplete = true
 		conn.handshakeConfirmed = true
+		close(conn.handshakeCompleteChan)
 		conn.mtuDiscoverer = newMTUDiscoverer(conn.rttStats, conn.config.initialPacketSize(), conn.maxMTU(), conn.qlogger)
 	}
 }
@@ -562,9 +563,64 @@ func TestConnectionServerInvalidPackets(t *testing.T) {
 			eventRecorder.Events(qlog.PacketDropped{}),
 		)
 	})
+
+	t.Run("Initial packet in a datagram smaller than 1200 bytes", func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		var eventRecorder events.Recorder
+		tc := newServerTestConnection(t,
+			mockCtrl,
+			nil,
+			false,
+			connectionOptTracer(&eventRecorder),
+			connectionOptUnpacker(NewMockUnpacker(mockCtrl)), // the packet must not be unpacked
+		)
+
+		p := getLongHeaderPacket(t,
+			tc.remoteAddr,
+			&wire.ExtendedHeader{
+				Header: wire.Header{
+					Type:             protocol.PacketTypeInitial,
+					DestConnectionID: tc.srcConnID,
+					SrcConnectionID:  tc.destConnID,
+					Version:          Version1,
+					Length:           1,
+				},
+				PacketNumberLen: protocol.PacketNumberLen1,
+			},
+			nil,
+		)
+		wasProcessed, err := tc.conn.handleOnePacket(p, 42, activePathID)
+		require.NoError(t, err)
+		require.False(t, wasProcessed)
+		require.Equal(t,
+			[]qlogwriter.Event{
+				qlog.PacketDropped{
+					Header: qlog.PacketHeader{
+						PacketType:       qlog.PacketTypeInitial,
+						DestConnectionID: tc.srcConnID,
+						SrcConnectionID:  tc.destConnID,
+						PacketNumber:     protocol.InvalidPacketNumber,
+					},
+					Raw:                     qlog.RawInfo{Length: int(p.Size()), PayloadLength: qlog.OmitLength},
+					DatagramPayloadChecksum: 42,
+					Trigger:                 qlog.PacketDropUnexpectedPacket,
+				},
+			},
+			eventRecorder.Events(qlog.PacketDropped{}),
+		)
+	})
 }
 
-func TestConnectionClientDrop0RTT(t *testing.T) {
+func TestConnectionClientInvalidPackets(t *testing.T) {
+	t.Run("0-RTT", func(t *testing.T) {
+		testConnectionClientInvalidPacket(t, wire.Header{Type: protocol.PacketType0RTT, Length: 2, Version: protocol.Version1}, qlog.PacketType0RTT)
+	})
+	t.Run("Initial with token", func(t *testing.T) {
+		testConnectionClientInvalidPacket(t, wire.Header{Type: protocol.PacketTypeInitial, Token: []byte("foobar"), Length: 2, Version: protocol.Version1}, qlog.PacketTypeInitial)
+	})
+}
+
+func testConnectionClientInvalidPacket(t *testing.T, hdr wire.Header, packetType qlog.PacketType) {
 	mockCtrl := gomock.NewController(t)
 	var eventRecorder events.Recorder
 	tc := newClientTestConnection(t, mockCtrl, nil, false, connectionOptTracer(&eventRecorder))
@@ -572,7 +628,7 @@ func TestConnectionClientDrop0RTT(t *testing.T) {
 	p := getLongHeaderPacket(t,
 		tc.remoteAddr,
 		&wire.ExtendedHeader{
-			Header:          wire.Header{Type: protocol.PacketType0RTT, Length: 2, Version: protocol.Version1},
+			Header:          hdr,
 			PacketNumberLen: protocol.PacketNumberLen2,
 		},
 		nil,
@@ -584,7 +640,7 @@ func TestConnectionClientDrop0RTT(t *testing.T) {
 		[]qlogwriter.Event{
 			qlog.PacketDropped{
 				Header: qlog.PacketHeader{
-					PacketType:   qlog.PacketType0RTT,
+					PacketType:   packetType,
 					PacketNumber: protocol.InvalidPacketNumber,
 				},
 				Raw:                     qlog.RawInfo{Length: int(p.Size()), PayloadLength: qlog.OmitLength},
@@ -615,14 +671,14 @@ func TestConnectionUnpacking(t *testing.T) {
 			DestConnectionID: tc.srcConnID,
 			SrcConnectionID:  protocol.ZeroLengthConnectionID,
 			Version:          protocol.Version1,
-			Length:           1,
+			Length:           1200,
 		},
 		PacketNumber:    0x37,
 		PacketNumberLen: protocol.PacketNumberLen1,
 	}
 	unpackedHdr := *hdr
 	unpackedHdr.PacketNumber = 0x1337
-	packet := getLongHeaderPacket(t, tc.remoteAddr, hdr, nil)
+	packet := getLongHeaderPacket(t, tc.remoteAddr, hdr, make([]byte, 1199))
 	packet.ecn = protocol.ECNCE
 	rcvTime := monotime.Now().Add(-10 * time.Second)
 	packet.rcvTime = rcvTime
@@ -647,7 +703,7 @@ func TestConnectionUnpacking(t *testing.T) {
 				},
 				Frames:                  []qlog.Frame{},
 				ECN:                     qlog.ECNCE,
-				Raw:                     qlog.RawInfo{Length: int(packet.Size()), PayloadLength: 1},
+				Raw:                     qlog.RawInfo{Length: int(packet.Size()), PayloadLength: int(hdr.Length)},
 				DatagramPayloadChecksum: 42,
 			},
 		},
@@ -656,7 +712,7 @@ func TestConnectionUnpacking(t *testing.T) {
 	eventRecorder.Clear()
 
 	// receive a duplicate of this packet
-	packet = getLongHeaderPacket(t, tc.remoteAddr, hdr, nil)
+	packet = getLongHeaderPacket(t, tc.remoteAddr, hdr, make([]byte, 1199))
 	unpacker.EXPECT().UnpackLongHeader(gomock.Any(), gomock.Any()).Return(&unpackedPacket{
 		encryptionLevel: protocol.EncryptionInitial,
 		hdr:             &unpackedHdr,
@@ -675,7 +731,7 @@ func TestConnectionUnpacking(t *testing.T) {
 					PacketNumber:     protocol.PacketNumber(0x1337),
 					Version:          protocol.Version1,
 				},
-				Raw:                     qlog.RawInfo{Length: int(packet.Size()), PayloadLength: 1},
+				Raw:                     qlog.RawInfo{Length: int(packet.Size()), PayloadLength: int(hdr.Length)},
 				DatagramPayloadChecksum: 43,
 				Trigger:                 qlog.PacketDropDuplicate,
 			},
@@ -738,7 +794,7 @@ func TestConnectionUnpackCoalescedPacket(t *testing.T) {
 			Type:             protocol.PacketTypeHandshake,
 			DestConnectionID: tc.srcConnID,
 			Version:          protocol.Version1,
-			Length:           1,
+			Length:           1200,
 		},
 		PacketNumber:    38,
 		PacketNumberLen: protocol.PacketNumberLen1,
@@ -762,7 +818,7 @@ func TestConnectionUnpackCoalescedPacket(t *testing.T) {
 
 	packet := getLongHeaderPacket(t, tc.remoteAddr, hdr1, nil)
 	firstPacketLen := packet.Size()
-	packet2 := getLongHeaderPacket(t, tc.remoteAddr, hdr2, nil)
+	packet2 := getLongHeaderPacket(t, tc.remoteAddr, hdr2, make([]byte, 1199)) // pads the datagram
 	packet3 := getLongHeaderPacket(t, tc.remoteAddr, hdr3, nil)
 	packet.data = append(packet.data, packet2.data...)
 	packet.data = append(packet.data, packet3.data...)
@@ -805,7 +861,7 @@ func TestConnectionUnpackCoalescedPacket(t *testing.T) {
 					PacketNumber:     protocol.PacketNumber(1338),
 					Version:          protocol.Version1,
 				},
-				Raw:                     qlog.RawInfo{Length: int(packet2.Size()), PayloadLength: 1},
+				Raw:                     qlog.RawInfo{Length: int(packet2.Size()), PayloadLength: int(hdr2.Length)},
 				DatagramPayloadChecksum: 42,
 				Frames:                  []qlog.Frame{{Frame: &wire.PingFrame{}}},
 				ECN:                     qlog.ECT1,
@@ -1212,6 +1268,23 @@ func TestConnectionHandleMaxStreamsFrame(t *testing.T) {
 	})
 }
 
+func TestConnectionTransportParametersDuring0RTT(t *testing.T) {
+	tc := newClientTestConnection(t, nil, nil, false)
+	tc.conn.restoreTransportParameters(&wire.TransportParameters{MaxBidiStreamNum: 1})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		tc.conn.ConnectionState()
+		tc.conn.OpenStream()
+	}()
+	require.NoError(t, tc.conn.handleTransportParameters(&wire.TransportParameters{
+		InitialSourceConnectionID:       tc.destConnID,
+		OriginalDestinationConnectionID: tc.destConnID,
+		MaxBidiStreamNum:                1,
+	}))
+	<-done
+}
+
 func TestConnectionTransportParameterValidationFailureServer(t *testing.T) {
 	tc := newServerTestConnection(t, nil, nil, false)
 	err := tc.conn.handleTransportParameters(&wire.TransportParameters{
@@ -1286,6 +1359,18 @@ func TestConnectionTransportParameterValidationFailureClient(t *testing.T) {
 		err := tc.conn.handleTransportParameters(params)
 		assert.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.TransportParameterError})
 		assert.ErrorContains(t, err, "expected retry_source_connection_id to equal")
+	})
+
+	t.Run("preferred_address with zero-length connection ID", func(t *testing.T) {
+		tc := newClientTestConnection(t, nil, nil, false)
+		tc.conn.handshakeDestConnID = protocol.ZeroLengthConnectionID
+		err := tc.conn.handleTransportParameters(&wire.TransportParameters{
+			OriginalDestinationConnectionID: tc.destConnID,
+			InitialSourceConnectionID:       protocol.ZeroLengthConnectionID,
+			PreferredAddress:                &wire.PreferredAddress{ConnectionID: protocol.ParseConnectionID([]byte{1, 2, 3, 4})},
+		})
+		assert.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.TransportParameterError})
+		assert.ErrorContains(t, err, "received preferred_address, although the server uses a zero-length connection ID")
 	})
 }
 
@@ -1410,8 +1495,9 @@ func testConnectionHandshakeClient(t *testing.T, usePreferredAddress bool) {
 	tc.sendConn.EXPECT().Write(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
 
 	// the state transition is driven by processing of a CRYPTO frame
+	serverConnID := protocol.ParseConnectionID([]byte{1, 2, 3, 4})
 	hdr := &wire.ExtendedHeader{
-		Header:          wire.Header{Type: protocol.PacketTypeHandshake, Version: protocol.Version1},
+		Header:          wire.Header{Type: protocol.PacketTypeHandshake, SrcConnectionID: serverConnID, Version: protocol.Version1},
 		PacketNumberLen: protocol.PacketNumberLen2,
 	}
 	data, err := (&wire.CryptoFrame{Data: []byte("foobar")}).Append(nil, protocol.Version1)
@@ -1419,6 +1505,7 @@ func testConnectionHandshakeClient(t *testing.T, usePreferredAddress bool) {
 
 	tp := &wire.TransportParameters{
 		OriginalDestinationConnectionID: tc.destConnID,
+		InitialSourceConnectionID:       serverConnID,
 		MaxIdleTimeout:                  time.Hour,
 	}
 	preferredAddressConnID := protocol.ParseConnectionID([]byte{10, 8, 6, 4})
@@ -1523,82 +1610,6 @@ func testConnectionHandshakeClient(t *testing.T, usePreferredAddress bool) {
 	select {
 	case err := <-errChan:
 		require.NoError(t, err)
-	case <-time.After(time.Second):
-		t.Fatal("timeout")
-	}
-}
-
-func TestConnection0RTTTransportParameters(t *testing.T) {
-	mockCtrl := gomock.NewController(t)
-	cs := mocks.NewMockCryptoSetup(mockCtrl)
-	unpacker := NewMockUnpacker(mockCtrl)
-	tc := newClientTestConnection(t, mockCtrl, nil, false, connectionOptCryptoSetup(cs), connectionOptUnpacker(unpacker))
-	tc.sendConn.EXPECT().Write(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
-
-	// the state transition is driven by processing of a CRYPTO frame
-	hdr := &wire.ExtendedHeader{
-		Header:          wire.Header{Type: protocol.PacketTypeHandshake, Version: protocol.Version1},
-		PacketNumberLen: protocol.PacketNumberLen2,
-	}
-	data, err := (&wire.CryptoFrame{Data: []byte("foobar")}).Append(nil, protocol.Version1)
-	require.NoError(t, err)
-
-	restored := &wire.TransportParameters{
-		ActiveConnectionIDLimit:        3,
-		InitialMaxData:                 0x5000,
-		InitialMaxStreamDataBidiLocal:  0x5000,
-		InitialMaxStreamDataBidiRemote: 1000,
-		InitialMaxStreamDataUni:        1000,
-		MaxBidiStreamNum:               500,
-		MaxUniStreamNum:                500,
-	}
-	new := *restored
-	new.MaxBidiStreamNum-- // the server is not allowed to reduce the limit
-	new.OriginalDestinationConnectionID = tc.destConnID
-
-	packedFirstPacket := make(chan struct{})
-	gomock.InOrder(
-		cs.EXPECT().StartHandshake(gomock.Any()),
-		cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventRestoredTransportParameters, TransportParameters: restored}),
-		cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventNoEvent}),
-		tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1).DoAndReturn(
-			func(b bool, bc protocol.ByteCount, t monotime.Time, v protocol.Version) (*coalescedPacket, error) {
-				close(packedFirstPacket)
-				return &coalescedPacket{buffer: udp.GetPacketBuffer(), longHdrPackets: []*longHeaderPacket{{header: hdr}}}, nil
-			},
-		),
-		// initial keys are dropped when the first handshake packet is sent
-		cs.EXPECT().DiscardInitialKeys(),
-		// no more data to send
-		unpacker.EXPECT().UnpackLongHeader(gomock.Any(), gomock.Any()).Return(
-			&unpackedPacket{hdr: hdr, encryptionLevel: protocol.EncryptionHandshake, data: data}, nil,
-		),
-		cs.EXPECT().HandleMessage([]byte("foobar"), protocol.EncryptionHandshake),
-		cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventReceivedTransportParameters, TransportParameters: &new}),
-		cs.EXPECT().ConnectionState().Return(handshake.ConnectionState{Used0RTT: true}),
-		// cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventNoEvent}),
-		cs.EXPECT().Close(),
-	)
-	tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1).Return(nil, nil).AnyTimes()
-	tc.packer.EXPECT().PackConnectionClose(gomock.Any(), gomock.Any(), protocol.Version1).Return(&coalescedPacket{buffer: udp.GetPacketBuffer()}, nil)
-	tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any(), gomock.Any())
-
-	errChan := make(chan error, 1)
-	go func() { errChan <- tc.conn.run() }()
-
-	select {
-	case <-packedFirstPacket:
-	case <-time.After(time.Second):
-		t.Fatal("timeout")
-	}
-
-	p := getLongHeaderPacket(t, tc.remoteAddr, hdr, nil)
-	tc.conn.handlePacket(receivedPacket{data: p.data, buffer: p.buffer, rcvTime: monotime.Now()})
-
-	select {
-	case err := <-errChan:
-		require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.ProtocolViolation})
-		require.ErrorContains(t, err, "server sent reduced limits after accepting 0-RTT data")
 	case <-time.After(time.Second):
 		t.Fatal("timeout")
 	}
@@ -1894,7 +1905,7 @@ func TestConnectionInitialPacketSizeFallback(t *testing.T) {
 			require.Equal(t, uint32(estimateMaxPayloadSize(protocol.MinInitialPacketSize)), tc.conn.maxPayloadSizeEstimate.Load())
 			require.Zero(t, tc.conn.config.InitialPacketSize)
 
-			tc.conn.peerParams = &wire.TransportParameters{MaxUDPPayloadSize: 1300, ActiveConnectionIDLimit: 2}
+			tc.conn.peerParams.Store(&wire.TransportParameters{MaxUDPPayloadSize: 1300, ActiveConnectionIDLimit: 2})
 			tc.conn.applyTransportParameters()
 			require.Equal(t, protocol.ByteCount(protocol.MinInitialPacketSize), tc.conn.maxPacketSize())
 
@@ -3316,9 +3327,13 @@ func testConnectionConnectionIDChanges(t *testing.T, sendRetry bool) {
 		)
 		eventRecorder.Clear()
 
-		// Send the second packet. We refuse to accept it, because the connection ID is changed again.
+		// Send an Initial and a Handshake packet. We refuse to accept them, because the connection ID is changed again.
 		packet2 := receivedPacket{data: makeInitialPacket(t, &hdr2), buffer: udp.GetPacketBuffer(), rcvTime: monotime.Now(), remoteAddr: tc.remoteAddr}
 		tc.conn.handlePacket(packet2)
+		hdr3 := hdr2
+		hdr3.Type = protocol.PacketTypeHandshake
+		packet3 := getLongHeaderPacket(t, tc.remoteAddr, &hdr3, make([]byte, 198))
+		tc.conn.handlePacket(packet3)
 
 		synctest.Wait()
 
@@ -3326,12 +3341,25 @@ func testConnectionConnectionIDChanges(t *testing.T, sendRetry bool) {
 			[]qlogwriter.Event{
 				qlog.PacketDropped{
 					Header: qlog.PacketHeader{
-						PacketType:   qlog.PacketTypeInitial,
-						PacketNumber: protocol.InvalidPacketNumber,
+						PacketType:       qlog.PacketTypeInitial,
+						DestConnectionID: tc.srcConnID,
+						SrcConnectionID:  newConnID2,
+						PacketNumber:     protocol.InvalidPacketNumber,
 					},
 					Raw:                     qlog.RawInfo{Length: int(packet2.Size()), PayloadLength: qlog.OmitLength},
 					DatagramPayloadChecksum: qlog.CalculateDatagramPayloadChecksum(packet2.data),
-					Trigger:                 qlog.PacketDropUnknownConnectionID,
+					Trigger:                 qlog.PacketDropUnexpectedSourceConnectionID,
+				},
+				qlog.PacketDropped{
+					Header: qlog.PacketHeader{
+						PacketType:       qlog.PacketTypeHandshake,
+						DestConnectionID: tc.srcConnID,
+						SrcConnectionID:  newConnID2,
+						PacketNumber:     protocol.InvalidPacketNumber,
+					},
+					Raw:                     qlog.RawInfo{Length: int(packet3.Size()), PayloadLength: qlog.OmitLength},
+					DatagramPayloadChecksum: qlog.CalculateDatagramPayloadChecksum(packet3.data),
+					Trigger:                 qlog.PacketDropUnexpectedSourceConnectionID,
 				},
 			},
 			eventRecorder.Events(qlog.PacketDropped{}, qlog.PacketReceived{}),
@@ -3598,6 +3626,13 @@ func TestConnectionMigrationServer(t *testing.T) {
 	tc := newServerTestConnection(t, nil, nil, false)
 	_, err := tc.conn.AddPath(&Transport{})
 	require.ErrorContains(t, err, "server cannot initiate connection migration")
+}
+
+func TestConnectionMigrationBeforeHandshakeComplete(t *testing.T) {
+	tc := newClientTestConnection(t, nil, nil, false)
+	tc.conn.restoreTransportParameters(&wire.TransportParameters{}) // remembered for 0-RTT
+	_, err := tc.conn.AddPath(&Transport{})
+	require.ErrorContains(t, err, "cannot add path before handshake completion")
 }
 
 func TestConnectionMigrationMTUDiscovery(t *testing.T) {
