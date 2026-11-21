@@ -2413,7 +2413,7 @@ func (c *Conn) handleCloseError(closeErr *closeError) {
 
 	// If this is a remote close we're done here
 	if isRemoteClose {
-		c.connIDGenerator.ReplaceWithClosed(nil, 3*c.rttStats.PTO(false))
+		c.connIDGenerator.ReplaceWithClosed(nil, 3*c.rttStats.PTO(true))
 		return
 	}
 	if closeErr.immediate {
@@ -2430,7 +2430,7 @@ func (c *Conn) handleCloseError(closeErr *closeError) {
 	if err != nil {
 		c.logger.Debugf("Error sending CONNECTION_CLOSE: %s", err)
 	}
-	c.connIDGenerator.ReplaceWithClosed(connClosePacket, 3*c.rttStats.PTO(false))
+	c.connIDGenerator.ReplaceWithClosed(connClosePacket, 3*c.rttStats.PTO(true))
 }
 
 func (c *Conn) dropEncryptionLevel(encLevel protocol.EncryptionLevel, now monotime.Time) {
@@ -2471,6 +2471,7 @@ func (c *Conn) restoreTransportParameters(params *wire.TransportParameters) {
 	}
 
 	c.peerParams.Store(params)
+	c.packer.SetMaxDatagramFrameSize(params.MaxDatagramFrameSize)
 	// Connection IDs are issued when the handshake completes, since 0-RTT might be rejected.
 	c.connFlowController.UpdateSendWindow(params.InitialMaxData)
 	c.streamsMap.HandleTransportParameters(params)
@@ -2488,6 +2489,7 @@ func (c *Conn) handleTransportParameters(params *wire.TransportParameters) error
 	}
 
 	c.peerParams.Store(params)
+	c.packer.SetMaxDatagramFrameSize(params.MaxDatagramFrameSize)
 	// On the client side we have to wait for handshake completion.
 	// During a 0-RTT connection, we are only allowed to use the new transport parameters for 1-RTT packets.
 	if c.perspective == protocol.PerspectiveServer {
@@ -3194,7 +3196,8 @@ func (c *Conn) SendDatagram(p []byte) error {
 		f.MaxDataLen(params.MaxDatagramFrameSize, c.version),
 		protocol.ByteCount(c.maxPayloadSizeEstimate.Load()),
 	)
-	if protocol.ByteCount(len(p)) > maxDataLen {
+	// An empty DATAGRAM frame with a length field is 2 bytes.
+	if protocol.ByteCount(len(p)) > maxDataLen || params.MaxDatagramFrameSize == 1 {
 		return &DatagramTooLargeError{MaxDatagramPayloadSize: int64(maxDataLen)}
 	}
 	f.Data = make([]byte, len(p))

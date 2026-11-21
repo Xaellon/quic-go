@@ -142,7 +142,7 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 		c.rejectWithHeaderFieldsTooLarge(str)
 		return
 	}
-	headerBlock, err := readHeaderBlock(str, hf.Length)
+	headerBlock, err := readHeaderBlock(fp, hf.Length)
 	if err != nil {
 		maybeQlogInvalidHeadersFrame(qlogger, str.StreamID(), hf.Length)
 		str.CancelRead(quic.StreamErrorCode(ErrCodeRequestIncomplete))
@@ -190,7 +190,7 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 		contentLength = req.ContentLength
 	}
 	hstr := newStream(str, conn, nil, func(r io.Reader, hf *headersFrame) error {
-		trailers, err := decodeTrailers(r, hf, maxHeaderBytes, decoder, qlogger, str.StreamID())
+		trailers, err := decodeTrailers(r, str, hf, maxHeaderBytes, decoder, qlogger)
 		if err != nil {
 			return err
 		}
@@ -223,7 +223,7 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 	req = req.WithContext(ctx)
 	context.AfterFunc(str.Context(), cancel)
 
-	r := newResponseWriter(hstr, conn, req.Method == http.MethodHead, c.logger)
+	r := newResponseWriter(hstr, conn, req.Method, c.logger)
 	handler := c.requestHandler
 	if handler == nil {
 		handler = http.DefaultServeMux
@@ -305,7 +305,9 @@ func (c *RawServerConn) handleControlStream(_ *quic.ReceiveStream, fp *framePars
 			urgency, incremental := parsePriority(frame.PriorityFieldValue)
 			c.rawConn.UpdateStreamPriority(quic.StreamID(frame.ElementID), urgency, incremental)
 		case *goAwayFrame:
-			// Server push is not supported, so there is no push state to update.
+			// Server push is not supported, so we ignore the push ID.
+			// We don't close the connection if it increased since the last GOAWAY frame,
+			// although RFC 9114, Section 5.2 requires it.
 		default:
 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "")
 			return
@@ -316,7 +318,7 @@ func (c *RawServerConn) handleControlStream(_ *quic.ReceiveStream, fp *framePars
 func (c *RawServerConn) rejectWithHeaderFieldsTooLarge(str *stateTrackingStream) {
 	hstr := newStream(str, c.rawConn, nil, nil, c.qlogger)
 	defer hstr.Close()
-	r := newResponseWriter(hstr, c.rawConn, false, c.logger)
+	r := newResponseWriter(hstr, c.rawConn, "", c.logger)
 	r.WriteHeader(http.StatusRequestHeaderFieldsTooLarge)
 	r.Flush()
 }

@@ -142,19 +142,22 @@ func (t *Transport) init() error {
 	if t.QUICConfig == nil {
 		t.QUICConfig = defaultQuicConfig.Clone()
 		t.QUICConfig.EnableDatagrams = t.EnableDatagrams
+	} else {
+		t.QUICConfig = t.QUICConfig.Clone()
 	}
 	if t.EnableDatagrams && !t.QUICConfig.EnableDatagrams {
 		return errors.New("HTTP Datagrams enabled, but QUIC Datagrams disabled")
 	}
 	if len(t.QUICConfig.Versions) == 0 {
-		t.QUICConfig = t.QUICConfig.Clone()
 		t.QUICConfig.Versions = []quic.Version{quic.SupportedVersions()[0]}
 	}
 	if len(t.QUICConfig.Versions) != 1 {
 		return errors.New("can only use a single QUIC version for dialing a HTTP/3 connection")
 	}
+	// RFC 9114, Section 6.1 requires closing the connection when the server opens a bidirectional stream.
+	// Disallowing them makes QUIC do that, saving a goroutine per connection that would accept them.
 	if t.QUICConfig.MaxIncomingStreams == 0 {
-		t.QUICConfig.MaxIncomingStreams = -1 // don't allow any bidirectional streams
+		t.QUICConfig.MaxIncomingStreams = -1
 	}
 	if t.Dial == nil {
 		udpConn, err := net.ListenUDP("udp", nil)

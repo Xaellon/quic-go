@@ -112,6 +112,7 @@ func newServerTestConnection(
 	sendConn.EXPECT().RemoteAddr().Return(remoteAddr).AnyTimes()
 	sendConn.EXPECT().LocalAddr().Return(localAddr).AnyTimes()
 	packer := NewMockPacker(mockCtrl)
+	packer.EXPECT().SetMaxDatagramFrameSize(gomock.Any()).AnyTimes()
 	b := make([]byte, 12)
 	rand.Read(b)
 	origDestConnID := protocol.ParseConnectionID(b[:6])
@@ -176,6 +177,7 @@ func newClientTestConnection(
 	sendConn.EXPECT().RemoteAddr().Return(remoteAddr).AnyTimes()
 	sendConn.EXPECT().LocalAddr().Return(localAddr).AnyTimes()
 	packer := NewMockPacker(mockCtrl)
+	packer.EXPECT().SetMaxDatagramFrameSize(gomock.Any()).AnyTimes()
 	b := make([]byte, 12)
 	rand.Read(b)
 	destConnID := protocol.ParseConnectionID(b[:6])
@@ -298,7 +300,8 @@ func testConnectionClose(t *testing.T, useApplicationClose bool, expectedErr err
 	synctest.Test(t, func(t *testing.T) {
 		mockCtrl := gomock.NewController(t)
 		var eventRecorder events.Recorder
-		tc := newServerTestConnection(t, mockCtrl, nil, false, connectionOptTracer(&eventRecorder))
+		tc := newServerTestConnection(t, mockCtrl, nil, false, connectionOptTracer(&eventRecorder), connectionOptRTT(10*time.Millisecond))
+		tc.conn.rttStats.SetMaxAckDelay(25 * time.Millisecond)
 		errChan := make(chan error, 1)
 
 		tc.connRunner.EXPECT().Remove(gomock.Any()).AnyTimes()
@@ -310,7 +313,7 @@ func testConnectionClose(t *testing.T, useApplicationClose bool, expectedErr err
 			tc.packer.EXPECT().PackConnectionClose(expectedErr, gomock.Any(), protocol.Version1).Return(&coalescedPacket{buffer: b}, nil)
 		}
 		tc.sendConn.EXPECT().Write([]byte("connection close"), gomock.Any(), gomock.Any())
-		tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+		tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any(), 3*tc.conn.rttStats.PTO(true))
 
 		go func() { errChan <- tc.conn.run() }()
 		tc.conn.closeLocal(expectedErr)
@@ -1023,7 +1026,9 @@ func TestConnectionRemoteClose(t *testing.T) {
 			false,
 			connectionOptTracer(&eventRecorder),
 			connectionOptUnpacker(unpacker),
+			connectionOptRTT(10*time.Millisecond),
 		)
+		tc.conn.rttStats.SetMaxAckDelay(25 * time.Millisecond)
 		ccf, err := (&wire.ConnectionCloseFrame{
 			ErrorCode:    uint64(qerr.StreamLimitError),
 			ReasonPhrase: "foobar",
@@ -1031,7 +1036,7 @@ func TestConnectionRemoteClose(t *testing.T) {
 		require.NoError(t, err)
 		unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).Return(protocol.PacketNumber(1), protocol.PacketNumberLen2, protocol.KeyPhaseBit(0), ccf, nil)
 
-		tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any(), gomock.Any())
+		tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any(), 3*tc.conn.rttStats.PTO(true))
 
 		errChan := make(chan error, 1)
 		go func() { errChan <- tc.conn.run() }()
@@ -3832,4 +3837,14 @@ func testConnectionDatagrams(t *testing.T, enabled bool) {
 	d, err = tc.conn.ReceiveDatagram(ctx)
 	require.NoError(t, err)
 	require.Equal(t, []byte("bar"), d)
+}
+
+func TestConnectionSendEmptyDatagram(t *testing.T) {
+	tc := newServerTestConnection(t, nil, &Config{EnableDatagrams: true}, false)
+	require.NoError(t, tc.conn.handleTransportParameters(&wire.TransportParameters{
+		InitialSourceConnectionID: protocol.ZeroLengthConnectionID,
+		MaxDatagramFrameSize:      1,
+	}))
+	// an empty DATAGRAM frame with a length field is 2 bytes
+	require.Equal(t, &DatagramTooLargeError{}, tc.conn.SendDatagram(nil))
 }
