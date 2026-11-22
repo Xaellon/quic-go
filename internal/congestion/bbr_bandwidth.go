@@ -8,6 +8,9 @@ import (
 	"github.com/quic-go/quic-go/internal/protocol"
 )
 
+// Bandwidth is a bandwidth measured in bits per second.
+type Bandwidth = bandwidth
+
 func bbrMulDiv(a, b, divisor uint64) uint64 {
 	if divisor == 0 {
 		return math.MaxUint64

@@ -443,8 +443,8 @@ func (p *packetPacker) PackCoalescedPacket(onlyAck bool, maxSize protocol.ByteCo
 	}
 
 	if !onlyAck && len(initialPayload.frames)+len(handshakePayload.frames)+len(zeroRTTPayload.frames)+len(zeroRTTPayload.streamFrames)+len(oneRTTPayload.frames)+len(oneRTTPayload.streamFrames) == 0 {
-		initialEmpty := initialSealer == nil || (!p.initialStream.HasData() && !p.retransmissionQueue.HasData(protocol.EncryptionInitial))
-		handshakeEmpty := handshakeSealer == nil || (!p.handshakeStream.HasData() && !p.retransmissionQueue.HasData(protocol.EncryptionHandshake))
+		initialEmpty := initialSealer == nil || (!p.cryptoStreamManager.HasData(protocol.EncryptionInitial) && !p.retransmissionQueue.HasData(protocol.EncryptionInitial))
+		handshakeEmpty := handshakeSealer == nil || (!p.cryptoStreamManager.HasData(protocol.EncryptionHandshake) && !p.retransmissionQueue.HasData(protocol.EncryptionHandshake))
 		if initialEmpty && handshakeEmpty {
 			p.onApplicationLimited()
 		}
