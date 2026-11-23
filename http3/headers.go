@@ -24,13 +24,30 @@ type qpackError struct{ err error }
 func (e *qpackError) Error() string { return fmt.Sprintf("qpack: %v", e.err) }
 func (e *qpackError) Unwrap() error { return e.err }
 
+// A fieldSectionReadError means that a field section was not read, so it wasn't decoded either.
+type fieldSectionReadError struct{ err error }
+
+func (e *fieldSectionReadError) Error() string { return e.err.Error() }
+func (e *fieldSectionReadError) Unwrap() error { return e.err }
+
 type headerFieldError struct {
 	error
 	InvalidName  bool
 	InvalidValue bool
 }
 
-var errHeaderTooLarge = errors.New("http3: headers too large")
+var (
+	errHeaderTooLarge       = errors.New("http3: headers too large")
+	errHeadersFrameTooLarge = errors.New("http3: HEADERS frame too large")
+)
+
+// decodeErrorCode is the stream error code for a header section that failed to decode.
+func decodeErrorCode(err error) quic.StreamErrorCode {
+	if _, ok := errors.AsType[*qpackError](err); ok {
+		return quic.StreamErrorCode(ErrCodeQPACKDecompressionFailed)
+	}
+	return quic.StreamErrorCode(ErrCodeMessageError)
+}
 
 // readHeaderBlock preallocates up to 8 KiB, growing larger buffers as data arrives.
 // The caller must check length against the configured header size limit first.
@@ -401,7 +418,6 @@ func validExtendedConnectProtocol(protocol string) bool {
 // updateResponseFromHeaders sets up http.Response as an HTTP/3 response,
 // using the decoded qpack header filed.
 // It is only called for the HTTP header (and not the HTTP trailer).
-// It takes an http.Response as an argument to allow the caller to set the trailer later on.
 func updateResponseFromHeaders(rsp *http.Response, decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *[]qpack.HeaderField) error {
 	hdr, err := parseHeaders(decodeFn, false, sizeLimit, headerFields)
 	if err != nil {
@@ -493,40 +509,4 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
 	}
 	_, err := wr.Write(b)
 	return true, err
-}
-
-// decodeTrailers reads the header block of hf from r and decodes the trailers.
-func decodeTrailers(r io.Reader, str *stateTrackingStream, hf *headersFrame, maxHeaderBytes int, decoder *qpack.Decoder, qlogger qlogwriter.Recorder) (http.Header, error) {
-	if hf.Length > uint64(maxHeaderBytes) {
-		maybeQlogInvalidHeadersFrame(qlogger, str.StreamID(), hf.Length)
-		return nil, fmt.Errorf("http3: HEADERS frame too large: %d bytes (max: %d)", hf.Length, maxHeaderBytes)
-	}
-
-	b, err := readHeaderBlock(r, hf.Length)
-	if err != nil {
-		return nil, err
-	}
-	decodeFn := decoder.Decode(b)
-	var fields []qpack.HeaderField
-	var headerFields *[]qpack.HeaderField
-	if qlogger != nil {
-		fields = make([]qpack.HeaderField, 0, 16)
-		headerFields = &fields
-	}
-	trailers, err := parseTrailers(decodeFn, maxHeaderBytes, headerFields)
-	if err != nil {
-		maybeQlogInvalidHeadersFrame(qlogger, str.StreamID(), hf.Length)
-		// Malformed trailers are a stream error of type H3_MESSAGE_ERROR.
-		// Trailers exceeding the size limit are not malformed.
-		_, isQPACKErr := errors.AsType[*qpackError](err)
-		if !isQPACKErr && !errors.Is(err, errHeaderTooLarge) {
-			str.CancelRead(quic.StreamErrorCode(ErrCodeMessageError))
-			str.CancelWrite(quic.StreamErrorCode(ErrCodeMessageError))
-		}
-		return nil, err
-	}
-	if qlogger != nil {
-		qlogParsedHeadersFrame(qlogger, str.StreamID(), hf, fields, nil)
-	}
-	return trailers, nil
 }

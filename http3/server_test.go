@@ -372,6 +372,67 @@ func TestServerStreamResetByClient(t *testing.T) {
 	require.False(t, called)
 }
 
+func TestServerConnectHeadersAfterRequest(t *testing.T) {
+	clientConn, serverConn := newConnPair(t)
+	str, err := clientConn.OpenStream()
+	require.NoError(t, err)
+	_, err = str.Write(encodeRequest(t, httptest.NewRequest(http.MethodConnect, "https://example.com", nil)))
+	require.NoError(t, err)
+	// only DATA frames are allowed on a CONNECT stream
+	_, err = writeTrailers(str, http.Header{"Foo": {"bar"}}, str.StreamID(), nil)
+	require.NoError(t, err)
+
+	go (&Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.ReadAll(r.Body) }),
+	}).ServeQUICConn(serverConn)
+
+	select {
+	case <-clientConn.Context().Done():
+		require.ErrorIs(t,
+			context.Cause(clientConn.Context()),
+			&quic.ApplicationError{Remote: true, ErrorCode: quic.ApplicationErrorCode(ErrCodeFrameUnexpected)},
+		)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for close")
+	}
+}
+
+func TestServerRejectsDatagrams(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodConnect} {
+		t.Run(method, func(t *testing.T) {
+			clientConn, serverConn := newConnPair(t, withDatagrams())
+			controlStr, err := clientConn.OpenUniStream()
+			require.NoError(t, err)
+			_, err = controlStr.Write((&settingsFrame{Datagram: true}).Append(quicvarint.Append(nil, streamTypeControlStream)))
+			require.NoError(t, err)
+			req, err := http.NewRequest(method, "https://www.example.com", nil)
+			require.NoError(t, err)
+			str, err := clientConn.OpenStream()
+			require.NoError(t, err)
+			_, err = str.Write(encodeRequest(t, req))
+			require.NoError(t, err)
+
+			handlerStarted := make(chan struct{})
+			s := &Server{
+				EnableDatagrams: true,
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					close(handlerStarted)
+					<-r.Context().Done()
+				}),
+			}
+			go s.ServeQUICConn(serverConn)
+
+			select {
+			case <-handlerStarted:
+			case <-time.After(time.Second):
+				t.Fatal("timeout")
+			}
+			require.NoError(t, clientConn.SendDatagram(quicvarint.Append(nil, uint64(str.StreamID()/4))))
+			expectStreamReadReset(t, str, quic.StreamErrorCode(ErrCodeDatagramError))
+		})
+	}
+}
+
 func TestServerReadHeaderTimeout(t *testing.T) {
 	clientConn, serverConn := newConnPair(t)
 	s := &Server{
@@ -591,7 +652,7 @@ func TestServerQlogClosedAfterHandlerReturns(t *testing.T) {
 		<-block
 	})
 	rec := &closeTrackingRecorder{closed: make(chan struct{})}
-	conn := newRawServerConn(serverConn, false, 0, rec, nil, context.Background(), handler, 0)
+	conn := newRawServerConn(serverConn, false, 0, rec, nil, context.Background(), handler, http.DefaultMaxHeaderBytes)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
