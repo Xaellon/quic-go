@@ -2018,7 +2018,7 @@ func (c *Conn) handleFrame(
 	case *wire.ResetStreamFrame:
 		err = c.streamsMap.HandleResetStreamFrame(frame, rcvTime)
 	case *wire.MaxDataFrame:
-		c.connFlowController.UpdateSendWindow(frame.MaximumData)
+		c.framer.UpdateSendWindow(frame.MaximumData)
 	case *wire.MaxStreamDataFrame:
 		err = c.streamsMap.HandleMaxStreamDataFrame(frame)
 	case *wire.MaxStreamsFrame:
@@ -2473,7 +2473,7 @@ func (c *Conn) restoreTransportParameters(params *wire.TransportParameters) {
 	c.peerParams.Store(params)
 	c.packer.SetMaxDatagramFrameSize(params.MaxDatagramFrameSize)
 	// Connection IDs are issued when the handshake completes, since 0-RTT might be rejected.
-	c.connFlowController.UpdateSendWindow(params.InitialMaxData)
+	c.framer.UpdateSendWindow(params.InitialMaxData)
 	c.streamsMap.HandleTransportParameters(params)
 }
 
@@ -2546,7 +2546,7 @@ func (c *Conn) applyTransportParameters() {
 	c.keepAliveInterval = min(c.config.KeepAlivePeriod, c.idleTimeout/2)
 	c.streamsMap.HandleTransportParameters(params)
 	c.frameParser.SetAckDelayExponent(params.AckDelayExponent)
-	c.connFlowController.UpdateSendWindow(params.InitialMaxData)
+	c.framer.UpdateSendWindow(params.InitialMaxData)
 	c.rttStats.SetMaxAckDelay(params.MaxAckDelay)
 	c.connIDGenerator.SetMaxActiveConnIDs(params.ActiveConnectionIDLimit)
 	if params.StatelessResetToken != nil {

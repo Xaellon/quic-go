@@ -351,26 +351,41 @@ func (s *SendStream) canBufferStreamFrame() bool {
 
 // popStreamFrame returns the next STREAM frame that is supposed to be sent on this stream
 // maxBytes is the maximum length this frame (including frame header) will have.
-// hasMoreData says if more data can be sent after this call without first
-// receiving a MAX_STREAM_DATA frame.
-func (s *SendStream) popStreamFrame(maxBytes protocol.ByteCount, v protocol.Version) (_ ackhandler.StreamFrame, _ *wire.StreamDataBlockedFrame, hasMoreData bool) {
+func (s *SendStream) popStreamFrame(maxBytes protocol.ByteCount, v protocol.Version) (ackhandler.StreamFrame, *wire.StreamDataBlockedFrame, sendState) {
 	s.mutex.Lock()
 	f, blocked, hasMoreData := s.popNewStreamFrameForPacket(maxBytes, v)
 	if f != nil {
 		s.numOutstandingFrames++
 	}
-	s.mutex.Unlock()
-	if blocked != nil {
-		hasMoreData = false
+	state := sendStateIdle
+	if hasMoreData && blocked == nil {
+		state = s.sendState()
 	}
+	s.mutex.Unlock()
 
 	if f == nil {
-		return ackhandler.StreamFrame{}, blocked, hasMoreData
+		return ackhandler.StreamFrame{}, blocked, state
 	}
 	return ackhandler.StreamFrame{
 		Frame:   f,
 		Handler: (*sendStreamAckHandler)(s),
-	}, blocked, hasMoreData
+	}, blocked, state
+}
+
+// sendState is called after popping a frame, if the stream might have more to send.
+func (s *SendStream) sendState() sendState {
+	// Only unreserved data needs flow control credit.
+	if s.nextFrameReserved || (s.nextFrame == nil && s.dataForWriting == nil) {
+		return sendStateReady
+	}
+	// The stream is queued again when it receives a MAX_STREAM_DATA frame.
+	if s.flowController.IsBlocked() {
+		return sendStateIdle
+	}
+	if s.flowController.IsConnectionBlocked() {
+		return sendStateConnBlocked
+	}
+	return sendStateReady
 }
 
 func (s *SendStream) popNewStreamFrameForPacket(maxBytes protocol.ByteCount, v protocol.Version) (_ *wire.StreamFrame, _ *wire.StreamDataBlockedFrame, hasMoreData bool) {
@@ -424,7 +439,7 @@ func (s *SendStream) popNewStreamFrameForPacket(maxBytes protocol.ByteCount, v p
 		maxDataLen = min(maxDataLen, f.MaxDataLen(maxBytes, v), protocol.ByteCount(len(s.dataForWriting)))
 	}
 	if maxDataLen == 0 {
-		return nil, nil, true
+		return nil, s.maybeGetBlockedFrame(), true
 	}
 	if limitedWrite {
 		added, limited := s.flowController.AddBytesSentWithLimiter(maxDataLen, s.writeLimiter)
@@ -450,12 +465,8 @@ func (s *SendStream) popNewStreamFrameForPacket(maxBytes protocol.ByteCount, v p
 		hasMoreData = false
 	}
 	var blocked *wire.StreamDataBlockedFrame
-	// Flow control for a reserved frame was consumed when it was queued. Don't
-	// report the stream blocked while reserved bytes can still be sent.
-	if f.DataLen() > 0 && !s.nextFrameReserved {
-		if isBlocked, offset := s.flowController.isNewlyBlocked(); isBlocked {
-			blocked = &wire.StreamDataBlockedFrame{StreamID: s.streamID, MaximumStreamData: offset}
-		}
+	if f.DataLen() > 0 {
+		blocked = s.maybeGetBlockedFrame()
 	}
 	// After a reset, the RESET_STREAM_AT frame carries the Final Size.
 	f.Fin = s.finishedWriting && s.resetErr == nil && s.dataForWriting == nil && s.nextFrame == nil && !s.finSent
@@ -463,6 +474,16 @@ func (s *SendStream) popNewStreamFrameForPacket(maxBytes protocol.ByteCount, v p
 		s.finSent = true
 	}
 	return f, blocked, hasMoreData
+}
+
+// maybeGetBlockedFrame returns a STREAM_DATA_BLOCKED frame if the stream just became blocked on stream flow control.
+func (s *SendStream) maybeGetBlockedFrame() *wire.StreamDataBlockedFrame {
+	// Flow control for a reserved frame was consumed when it was queued. Don't
+	// report the stream blocked while reserved bytes can still be sent.
+	if s.nextFrameReserved || !s.flowController.IsNewlyBlocked() {
+		return nil
+	}
+	return &wire.StreamDataBlockedFrame{StreamID: s.streamID, MaximumStreamData: s.writeOffset}
 }
 
 // popNewStreamFrame returns a new STREAM frame to send for this stream
